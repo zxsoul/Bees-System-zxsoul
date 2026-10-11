@@ -6,13 +6,15 @@
 Wikforge 面向 ToB 团队管理场景，解决「主管依赖 3-7 天一次的口头汇报会掌握项目进度、
 周期长、双方耗时、信息失真」的问题，把进度汇报日常化：
 
-- **员工端（零填报）**：日常工作中随手把截图、日志、文档上传到团队空间，
-  系统自动完成解析入库；每天 18:47 定时任务（或手动一键）由 AI 聚合当天
-  全部材料，合成四段式工作日报（今日完成 / 进行中与进度 / 阻塞与风险 /
-  明日计划），日报再次回流入库，形成可检索、可追溯的工作留痕。
+- **员工端（零填报）**：日常工作中随手把截图、日志、文档传到「今日工作台」的
+  个人材料缓冲区（Redis 暂存，与空间解耦，24h 自动清空，不进长期知识库，
+  传错可随时删除重传）；每天 18:47 定时任务（或手动一键）由 AI 聚合当天
+  全部材料，截图走多模态视觉识别，合成**图文并茂**的四段式工作日报
+  （今日完成 / 进行中与进度 / 阻塞与风险 / 明日计划，数据图表直接嵌入原图），
+  日报与被引用图片长期入库，形成可检索、可追溯的工作留痕。
 - **主管端（碎片时间掌控进度）**：无需召集汇报会，主管在任意空闲时刻用
   自然语言向 RAG 问答询问「今天某部门完成了哪些内容」「某模块进度如何」，
-  多路召回 + 精排保证答案带引用、可溯源。
+  多路召回 + 精排保证答案带引用、可溯源；全员日报同样图文并茂。
 - **进度预警工作流**：每晚 21:23 定时任务汇总空间内最近 7 天全员日报，
   LLM 对比工作项的跨天进度轨迹，识别「连续多天无进展 / 从日报中消失 /
   风险反复出现」的事项并生成预警，防止团队注意力过度聚焦而忽略进度死角。
@@ -23,8 +25,8 @@ Wikforge 面向 ToB 团队管理场景，解决「主管依赖 3-7 天一次的�
 ## ✨ 核心能力
 
 ```
-📸 材料采集           截图 / 日志 / 文档即传即入库: PDF / DOCX / Markdown / HTML / 源代码 + LLM 视觉兜底
-📝 AI 日报合成        按「员工+日期」聚合当日材料 → LLM 四段式日报 → 回流入库（工作留痕）
+📸 材料缓冲区         截图 / 日志 / 文档随手传: Redis 个人暂存, 与空间解耦, 24h 自动清空, 可查看/删除
+📝 AI 日报合成        按「员工+日期」聚合缓冲区材料 → 多模态识别截图 → 图文并茂四段式日报 → 回流入库留痕
 🚨 进度预警           Celery Beat 每日汇总 7 天日报 → LLM 跨天进度对比 → 停滞/消失/风险预警
 🔍 复合搜索           BM25 + Dense Vector + Sparse Vector + RRF 融合 + Cross-Encoder 重排
 🎯 Profile 系统       自动匹配文档类型 (通用文本 / 中式技术规范 / 扫描版 PDF)
@@ -182,9 +184,10 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph Employee["👤 员工端"]
-        M[截图/日志/文档<br/>即传即入库] --> AGG[按 员工+日期 聚合<br/>当日 chunk]
-        AGG --> GEN[LLM 四段式合成<br/>今日完成/进行中/风险/计划]
-        GEN --> RE[日报回流入库<br/>走完整 pipeline]
+        M[截图/日志/文档<br/>随手传入个人缓冲区<br/>Redis · 24h 自动清空] --> AGG[按 员工+日期 聚合<br/>材料编号锚点]
+        AGG --> GEN[多模态识别截图<br/>LLM 四段式合成<br/>IMG 占位符插图]
+        GEN --> EMB[被引用图片转存 MinIO<br/>report-assets 长期留存]
+        EMB --> RE[日报回流入库<br/>走完整 pipeline]
     end
 
     RE --> RAGQ[主管端 RAG 进度问答<br/>自然语言 + 引用溯源]
@@ -209,9 +212,15 @@ flowchart TB
 
 **关键设计**
 
-- **幂等与防自引用**：`(space_id, user_id, report_date)` 唯一约束，同日重复生成默认返回已有
-  日报；聚合材料时排除标题为「工作日报-*」的回流文档，避免日报喂给下一次日报合成。
-- **异常降级**：日报 LLM 合成失败仅标记该日报行 failed，原始材料检索链路不受影响；
+- **缓冲区与知识库隔离**：材料只进 Redis 个人缓冲区（与空间解耦，TTL 24h
+  自动清空），不经过文档管线、不出现在「文档管理」，临时素材零污染长期检索；
+  日报合成时才按空间归档。
+- **图文并茂**：LLM 用 `[[IMG:Mn]]` 占位符标记插图位置，被引用的截图从缓冲区
+  转存 MinIO `report-assets/` 长期保存，前端带 JWT 渲染鉴权图片。
+- **幂等**：`(space_id, user_id, report_date)` 唯一约束，同日重复生成默认
+  返回已有日报；`force` 重算覆盖。
+- **异常降级**：单张截图识别失败降级为占位说明、日报 LLM 合成失败仅标记该日报行
+  failed，均不影响缓冲区材料；
   预警 LLM 输出做鲁棒 JSON 解析（容忍代码块包裹/噪声），解析失败当轮静默跳过。
 - **权限模型复用**：员工只能生成/查看自己的日报；主管由管理员授予空间 `write` 权限后
   可看全员日报与预警，普通成员 `read` 权限天然被 ABAC 拦截（403）。
@@ -293,8 +302,8 @@ make reset           # 完全清理 (会丢数据!)
 wikforge/
 ├── backend/              # Python / FastAPI
 │   ├── app/
-│   │   ├── api/          # 路由层 (auth/documents/search/qa/reports/alerts/admin_*)
-│   │   ├── services/     # 业务逻辑 (含 report_service 日报合成 / alert_service 进度预警)
+│   │   ├── api/          # 路由层 (auth/documents/search/qa/reports/alerts/daily_materials/admin_*)
+│   │   ├── services/     # 业务逻辑 (daily_material_service 缓冲区 / report_service 日报合成 / alert_service 进度预警)
 │   │   ├── tasks/        # Celery 任务 (pipeline.py 是核心; report_tasks.py 日报/预警定时任务)
 │   │   ├── models/       # SQLAlchemy ORM (含 daily_report / progress_alert)
 │   │   ├── core/         # 基础设施 (db/redis/qdrant/opensearch/minio)
@@ -303,9 +312,9 @@ wikforge/
 │   ├── tests/            # 单元 + 集成测试 (2054 个)
 │   └── eval/             # 检索质量评估 (Recall@K / MRR / NDCG)
 ├── frontend/             # Next.js 14
-│   ├── src/app/          # App Router 页面 (workbench 员工工作台 / alerts 主管进度中心)
-│   ├── src/components/   # UI 组件
-│   ├── src/lib/          # api-client / reports-api / utils
+│   ├── src/app/          # App Router 页面 (workbench 员工工作台+材料查看页 / alerts 主管进度中心)
+│   ├── src/components/   # UI 组件 (含 report-content 日报图文渲染)
+│   ├── src/lib/          # api-client / reports-api / daily-materials-api / utils
 │   └── src/stores/       # Zustand stores
 ├── scripts/              # verify_compose / smoke-test / backup
 ├── secrets/              # 本地凭证速查 (gitignored,不入库)

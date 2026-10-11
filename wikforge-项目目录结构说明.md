@@ -2,7 +2,7 @@
 
 > 项目路径：`C:\Users\zxsoul\Desktop\面试\agent应用开发\wikforge-main`
 >
-> 项目定位：**企业知识库 + RAG 问答**全栈系统
+> 项目定位：**智能工作汇报与进度洞察（今日速汇报）+ 企业知识库 + RAG 问答**全栈系统
 > 技术栈：FastAPI 后端 + Next.js 前端 + Celery 异步流水线 + PostgreSQL / OpenSearch / Qdrant / Redis / MinIO + LiteLLM
 
 ---
@@ -55,6 +55,10 @@ app/core/
 ├── search.py                  # 搜索接口
 ├── rag.py                     # RAG 问答接口
 ├── qa.py                      # 问答（会话历史相关）
+├── reports.py                 # 工作日报：生成 / 我的 / 全员 / 详情 + 日报内嵌图片附件
+├── alerts.py                  # 进度预警：列表 / 确认 / 手动触发检测
+├── daily_materials.py         # 今日材料缓冲区：上传 / 列表 / 查看(raw) / 删除
+│                              #   （纯个人暂存，Redis 24h 自动清空，与空间解耦）
 ├── feedback.py                # 搜索结果用户反馈
 ├── permissions.py             # 权限管理
 ├── ik_dict.py                 # IK 分词器远程词库分发（让 OpenSearch 同步领域词典）
@@ -76,6 +80,8 @@ app/core/
 ├── space.py / folder.py       # 空间（顶级组织单元）/ 文件夹层级
 ├── document.py / document_tag.py    # 文档元数据与处理状态 / 标签
 ├── chat.py                    # 问答会话与消息记录
+├── daily_report.py            # AI 日报（space+user+date 唯一约束，工作留痕）
+├── progress_alert.py          # 进度预警记录（open/acknowledged/resolved 闭环）
 ├── permission.py              # ABAC 权限模型
 ├── document_profile.py / profile_version.py  # 文档解析策略"档案"及其版本历史
 ├── document_review.py         # 解析质量人工审核工作流
@@ -102,6 +108,18 @@ app/core/
 │                              #   （≈ Retriever + Rerank）
 ├── embedding_service.py       # 稠密+稀疏向量生成（≈ Embeddings 接口）
 └── conversation_service.py    # 会话历史管理（≈ Memory）
+```
+
+**工作汇报场景（今日速汇报，2026-10 新增）：**
+
+```
+├── daily_material_service.py  # ★ 材料缓冲区：Redis 个人暂存（TTL 24h、与空间解耦、
+│                              #   可查看/删除，不进文档管线、不污染长期知识库）
+├── report_service.py          # ★ 日报合成：聚合缓冲区材料 → 多模态识别截图 →
+│                              #   四段式合成（[[IMG:Mn]] 占位符插图）→ 被引用图片
+│                              #   转存 MinIO report-assets/ → 日报回流入库留痕
+└── alert_service.py           # 进度预警：汇总 7 天日报 → LLM 跨天进度对比 →
+                               #   停滞 / 消失 / 风险反复三级预警
 ```
 
 **文档处理流水线（RAG 的"入库"侧，对应 LangChain Loader/Splitter）：**
@@ -137,6 +155,8 @@ app/core/
 
 ```
 ├── pipeline.py                # 文档处理流水线任务链：解析→清洗→分块→向量化→索引
+├── report_tasks.py            # 日报/预警定时任务：18:47 自动全员日报（扫描缓冲区
+│                              #   活跃用户 × 写权限空间）+ 21:23 停滞检测
 ├── permission_tasks.py        # 权限变更异步同步到 Qdrant（保证检索过滤即时生效）
 └── watchdog.py                # 看门狗：捞回卡在处理中的文档
 ```
@@ -166,7 +186,10 @@ src/app/                       # 路由页面
 ├── (auth)/                    # 登录/注册/OIDC 回调
 └── (main)/                    # 主界面：
                                #   chat/       问答界面
-                               #   documents/  文档管理
+                               #   workbench/  今日工作台（材料缓冲区 + 日报生成区
+                               #               + materials/[id] 材料查看页）
+                               #   alerts/     主管进度中心（进度预警 + 全员日报）
+                               #   documents/  文档管理（长期知识库，与缓冲区完全隔离）
                                #   search/     搜索
                                #   dashboard/  仪表盘
                                #   spaces/     空间管理
