@@ -101,3 +101,6 @@ tmp/
 # .kiro/
 backend/celerybeat-schedule
 backups/
+
+# 本地开发专用 compose 覆盖文件 (只存在于本地, 勿提交)
+docker-compose.override.yml
