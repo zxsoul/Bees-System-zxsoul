@@ -1,32 +1,43 @@
 "use client";
 
 /**
- * 员工端 · 今日工作台
+ * 员工端 · 今日工作台（今日速汇报）
  *
- * 员工日常只需把截图 / 日志 / 文档拖进「文档管理」上传，本页负责：
- * 1. 一键生成当日工作日报（AI 聚合当天全部已入库材料合成）；
- * 2. 查看今日日报内容（四段式 Markdown 渲染）；
- * 3. 浏览自己的历史日报（工作留痕）。
+ * 页面结构：
+ * 1. 今日材料缓冲区 —— 员工把截图 / 日志 / 文档直接传到这里（Redis 暂存，
+ *    不进「文档管理」的长期知识库，48h 自动过期）。每份材料可点击跳转到
+ *    查看页核对内容，误传可删除后重传。
+ * 2. 今日日报生成区 —— 点击「生成今日日报」，AI 聚合缓冲区全部材料合成
+ *    四段式日报，生成内容直接呈现在这里。
+ * 3. 历史日报 —— 过往日报留痕。
  *
  * 日报每天在 18:47 也会由系统定时任务自动生成，手动生成只是为了
  * 「马上看到结果」。
  */
 
-import { useCallback, useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CalendarDays,
+  Eye,
+  File,
   FileText,
+  Image as ImageIcon,
+  Inbox,
   Loader2,
   RefreshCw,
   Sparkles,
+  Trash2,
   Upload,
 } from "lucide-react";
 import Link from "next/link";
 
 import { apiClient } from "@/lib/api-client";
+import {
+  dailyMaterialsApi,
+  type DailyMaterial,
+} from "@/lib/daily-materials-api";
 import { reportsApi, type DailyReport } from "@/lib/reports-api";
+import { ReportContent } from "@/components/report-content";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
@@ -44,13 +55,41 @@ const STATUS_LABEL: Record<DailyReport["status"], string> = {
   failed: "生成失败",
 };
 
+const KIND_ICON: Record<DailyMaterial["kind"], typeof FileText> = {
+  text: FileText,
+  image: ImageIcon,
+  other: File,
+};
+
+const KIND_LABEL: Record<DailyMaterial["kind"], string> = {
+  text: "文本",
+  image: "截图",
+  other: "文件",
+};
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatTime(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
 export default function WorkbenchPage() {
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [spaceId, setSpaceId] = useState<string>("");
+  const [materials, setMaterials] = useState<DailyMaterial[]>([]);
   const [todayReport, setTodayReport] = useState<DailyReport | null>(null);
   const [history, setHistory] = useState<DailyReport[]>([]);
   const [loading, setLoading] = useState(true);
+  const [materialsLoading, setMaterialsLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const { addToast } = useToast();
 
   // 加载空间列表，默认选中第一个
@@ -64,7 +103,67 @@ export default function WorkbenchPage() {
         addToast({ type: "error", message: "加载空间列表失败" });
       }
     })();
-  }, []);
+  }, [addToast]);
+
+  // ─── 缓冲区材料（个人暂存，与空间无关） ─────────────────────────
+
+  const loadMaterials = useCallback(async () => {
+    setMaterialsLoading(true);
+    try {
+      setMaterials(await dailyMaterialsApi.list());
+    } catch {
+      addToast({ type: "error", message: "加载缓冲区材料失败" });
+    } finally {
+      setMaterialsLoading(false);
+    }
+  }, [addToast]);
+
+  const handleFilesSelected = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // 允许重复选择同一文件
+    if (!files.length) return;
+
+    setUploading(true);
+    let ok = 0;
+    for (const file of files) {
+      try {
+        await dailyMaterialsApi.upload(file);
+        ok += 1;
+      } catch (err) {
+        addToast({
+          type: "error",
+          message: `「${file.name}」上传失败`,
+          description: err instanceof Error ? err.message : undefined,
+        });
+      }
+    }
+    if (ok > 0) {
+      addToast({
+        type: "success",
+        message: `已上传 ${ok} 份材料到缓冲区`,
+        description: "材料仅暂存用于今日日报，次日自动清空，不进文档管理",
+      });
+    }
+    setUploading(false);
+    loadMaterials();
+  };
+
+  const handleDeleteMaterial = async (m: DailyMaterial) => {
+    setDeletingId(m.id);
+    try {
+      await dailyMaterialsApi.remove(m.id);
+      addToast({ type: "success", message: `已删除「${m.filename}」` });
+      loadMaterials();
+    } catch {
+      addToast({ type: "error", message: "删除失败，请重试" });
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  // ─── 日报 ────────────────────────────────────────────────────────
 
   const loadReports = useCallback(
     async (sid: string) => {
@@ -90,6 +189,11 @@ export default function WorkbenchPage() {
     loadReports(spaceId);
   }, [spaceId, loadReports]);
 
+  // 缓冲区是个人暂存区，与空间选择无关，只需加载一次
+  useEffect(() => {
+    loadMaterials();
+  }, [loadMaterials]);
+
   const handleGenerate = async (force: boolean) => {
     if (!spaceId) return;
     setGenerating(true);
@@ -99,7 +203,7 @@ export default function WorkbenchPage() {
       addToast({
         type: "success",
         message: force ? "日报已重新生成" : "日报生成成功",
-        description: "日报已自动入库，主管可以随时检索到",
+        description: "日报已自动入库留痕，主管可以随时检索到",
       });
       loadReports(spaceId);
     } catch (err) {
@@ -107,12 +211,14 @@ export default function WorkbenchPage() {
         type: "error",
         message: "日报生成失败",
         description:
-          err instanceof Error ? err.message : "请确认今天已上传工作材料",
+          err instanceof Error ? err.message : "请先上传今日工作材料",
       });
     } finally {
       setGenerating(false);
     }
   };
+
+  // ─── 渲染 ────────────────────────────────────────────────────────
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -120,7 +226,7 @@ export default function WorkbenchPage() {
         <div>
           <h1 className="text-2xl font-bold">今日工作台</h1>
           <p className="text-sm text-muted-foreground">
-            上传工作材料，AI 自动为你生成当日工作日报
+            把今天的工作材料传进缓冲区，AI 一键为你生成当日工作日报
           </p>
         </div>
         {spaces.length > 1 && (
@@ -138,7 +244,97 @@ export default function WorkbenchPage() {
         )}
       </div>
 
-      {/* 今日日报 */}
+      {/* 今日材料缓冲区 */}
+      <Card className="p-6">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Inbox className="h-5 w-5 text-primary" />
+            <h2 className="text-lg font-semibold">今日材料缓冲区</h2>
+            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+              {materials.length} 份
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={handleFilesSelected}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={uploading}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {uploading ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <Upload className="mr-1 h-4 w-4" />
+              )}
+              上传材料
+            </Button>
+          </div>
+        </div>
+
+        <Separator className="my-4" />
+
+        <p className="mb-3 text-xs text-muted-foreground">
+          缓冲区是你的个人暂存区，与空间无关：材料仅用于生成今日日报，
+          次日自动清空，不会进入「文档管理」的长期知识库。传错了可以随时删除重传。
+        </p>
+
+        {materialsLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> 加载中…
+          </div>
+        ) : materials.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            缓冲区是空的。点击「上传材料」把今天的截图、日志或文档放进来。
+          </p>
+        ) : (
+          <ul className="divide-y">
+            {materials.map((m) => {
+              const Icon = KIND_ICON[m.kind];
+              return (
+                <li key={m.id} className="flex items-center gap-3 py-2.5">
+                  <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">{m.filename}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {KIND_LABEL[m.kind]} · {formatSize(m.size)} ·{" "}
+                      {formatTime(m.uploaded_at)} 上传
+                    </p>
+                  </div>
+                  <Button variant="ghost" size="sm" asChild>
+                    <Link href={`/workbench/materials/${m.id}`}>
+                      <Eye className="mr-1 h-4 w-4" />
+                      查看
+                    </Link>
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive hover:text-destructive"
+                    disabled={deletingId === m.id}
+                    onClick={() => handleDeleteMaterial(m)}
+                  >
+                    {deletingId === m.id ? (
+                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="mr-1 h-4 w-4" />
+                    )}
+                    删除
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </Card>
+
+      {/* 今日日报生成区 */}
       <Card className="p-6">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -161,12 +357,6 @@ export default function WorkbenchPage() {
             )}
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" asChild>
-              <Link href="/documents">
-                <Upload className="mr-1 h-4 w-4" />
-                去上传材料
-              </Link>
-            </Button>
             {todayReport ? (
               <Button
                 size="sm"
@@ -184,7 +374,7 @@ export default function WorkbenchPage() {
             ) : (
               <Button
                 size="sm"
-                disabled={generating || !spaceId}
+                disabled={generating || !spaceId || materials.length === 0}
                 onClick={() => handleGenerate(false)}
               >
                 {generating ? (
@@ -200,16 +390,18 @@ export default function WorkbenchPage() {
 
         <Separator className="my-4" />
 
-        {loading ? (
+        {generating ? (
+          <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            AI 正在聚合缓冲区 {materials.length} 份材料生成日报，截图较多时
+            需要 1-2 分钟，请稍候…
+          </div>
+        ) : loading ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" /> 加载中…
           </div>
         ) : todayReport?.status === "completed" ? (
-          <article className="prose prose-sm max-w-none dark:prose-invert">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {todayReport.content}
-            </ReactMarkdown>
-          </article>
+          <ReportContent content={todayReport.content} />
         ) : todayReport?.status === "failed" ? (
           <p className="text-sm text-destructive">
             生成失败：{todayReport.error_detail || "未知错误"}
@@ -217,8 +409,8 @@ export default function WorkbenchPage() {
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">
-            今天还没有日报。把截图、日志或文档上传到团队空间后，点击
-            「生成今日日报」即可。每天 18:47 系统也会自动生成。
+            今天还没有日报。先把材料传到上方缓冲区，然后点击
+            「生成今日日报」。每天 18:47 系统也会自动生成。
           </p>
         )}
       </Card>

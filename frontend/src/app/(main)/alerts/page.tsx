@@ -14,8 +14,6 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   AlertTriangle,
   BellRing,
@@ -35,6 +33,7 @@ import {
   type DailyReport,
   type ProgressAlert,
 } from "@/lib/reports-api";
+import { ReportContent } from "@/components/report-content";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
@@ -350,11 +349,7 @@ export default function AlertsPage() {
                     {expanded && (
                       <>
                         <Separator className="my-3" />
-                        <article className="prose prose-sm max-w-none dark:prose-invert">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {report.content}
-                          </ReactMarkdown>
-                        </article>
+                        <ReportContent content={report.content} />
                       </>
                     )}
                   </Card>

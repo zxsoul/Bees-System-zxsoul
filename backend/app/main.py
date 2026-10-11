@@ -26,6 +26,7 @@ from app.api.admin_user_permissions import (
 from app.api.admin_users import router as admin_users_router
 from app.api.alerts import router as alerts_router
 from app.api.auth import router as auth_router
+from app.api.daily_materials import router as daily_materials_router
 from app.api.documents import router as documents_router
 from app.api.feedback import router as feedback_router
 from app.api.health import router as health_router
@@ -85,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(qa_router)
     app.include_router(reports_router)
     app.include_router(alerts_router)
+    app.include_router(daily_materials_router)
     app.include_router(admin_profiles_router)
     app.include_router(admin_reviews_router)
     app.include_router(admin_dictionaries_router)

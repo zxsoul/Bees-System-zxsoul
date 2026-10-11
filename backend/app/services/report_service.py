@@ -2,19 +2,20 @@
 
 流程（对应工作汇报场景的「机器采、机器写、人只看」）：
 
-1. **聚合**：按 (space, user, report_date) 捞出员工当日上传且已处理完成的
-   文档（截图 / 日志 / 文档），排除已生成的日报文档本身，避免日报回流
-   后污染下一次聚合（检索结果自引用问题）。
-2. **取料**：从 OpenSearch ``chunks`` 索引按 document_id 取回正文片段，
-   按文档数均摊长度预算，保证 LLM 上下文可控。
+1. **聚合**：按 (user, report_date) 从 Redis 个人材料缓冲区取出员工
+   当日主动上传的临时材料（截图 / 日志 / 文档）。缓冲区与空间完全
+   解耦——材料不属于任何空间，只是员工个人的当日暂存，TTL 24h
+   自动清空，**不进入长期知识库**（与「文档管理」的长期存储完全隔离）。
+2. **取料**：文本类材料直接解码；截图类材料调用多模态 LLM 做内容识别；
+   按材料数均摊长度预算，保证 LLM 上下文可控。
 3. **合成**：调用 :class:`LLMGateway` 生成固定四段式 Markdown 日报
    （今日完成 / 进行中与进度 / 阻塞与风险 / 明日计划）。
 4. **回流**：日报 Markdown 存入 MinIO 并创建 Document，走与手工上传完全
-   一致的 pipeline（解析 → 清洗 → 分块 → 向量化 → 双索引），主管端
-   RAG 问答因此可以直接检索到日报内容，无需任何特殊检索逻辑。
+   一致的 pipeline（解析 → 清洗 → 分块 → 向量化 → 双索引），形成长期
+   工作留痕，主管端 RAG 问答因此可以直接检索到日报内容。
 
-失败语义：LLM 调用失败时日报行落为 ``failed``，不影响原始材料入库；
-主管端的兜底是仍然可以直接检索原始材料（查询增强 + 多路召回链路不变）。
+失败语义：LLM 调用失败时日报行落为 ``failed``，缓冲区材料不受影响；
+单张截图识别失败会降级为占位说明，不阻塞整份日报。
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ import asyncio
 import io
 import logging
 import os
+import re
 import uuid
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,13 +34,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.exceptions import ForbiddenException, NotFoundException, ValidationException
 from app.core.minio import ensure_bucket_exists, get_minio_client
-from app.core.opensearch import INDEX_NAME, get_opensearch_client
 from app.core.redis import get_redis
 from app.models.daily_report import DailyReport, DailyReportStatus
 from app.models.document import Document, DocumentStatus
 from app.models.permission import ResourceType
 from app.models.space import Space
 from app.models.user import User
+from app.services.daily_material_service import DailyMaterialService
 from app.services.llm_gateway import LLMGateway, LLMGatewayError
 from app.services.permission_service import Action, PermissionService
 
@@ -50,13 +52,17 @@ except Exception:  # pragma: no cover — Celery 不可用时 (单元测试) 不
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# 单个文档贡献给日报合成的最大字符数（按文档数均摊前的单文档上限）
-MAX_CHARS_PER_DOCUMENT = 4000
+# 单份材料贡献给日报合成的最大字符数（按材料数均摊前的单份上限）
+MAX_CHARS_PER_MATERIAL = 4000
 # 喂给 LLM 的材料总字符数上限，超出部分按时间顺序截断
 MAX_TOTAL_MATERIAL_CHARS = 16000
-# 每个文档最多取回的 chunk 数
-MAX_CHUNKS_PER_DOCUMENT = 12
-# 日报文档标题前缀，用于聚合时排除日报自身、前端展示标识
+# 单次日报合成最多识别的截图数（每张一次多模态调用，控制耗时）
+MAX_IMAGES_PER_REPORT = 6
+# 单张截图多模态识别的超时（秒）
+IMAGE_DESCRIBE_TIMEOUT = 90
+# 日报正文中 LLM 用于插图的占位符（如 [[IMG:M1]]）
+IMG_PLACEHOLDER_RE = re.compile(r"\[\[IMG:(M\d+)\]\]")
+# 日报文档标题前缀，用于前端展示标识
 REPORT_TITLE_PREFIX = "工作日报"
 
 REPORT_SYSTEM_PROMPT = """你是一名严谨的工作汇报助手。根据员工当天上传的工作材料
@@ -66,6 +72,11 @@ REPORT_SYSTEM_PROMPT = """你是一名严谨的工作汇报助手。根据员工
 - 只陈述材料中出现的事实，禁止编造材料中不存在的工作内容、数据或结论。
 - 每个要点尽量保留可核对的信息：文件名、模块名、数据指标、时间节点。
 - 无法从材料判断的部分直接写「材料中未体现」，不要硬凑。
+- 插图规则（图文并茂）：每份材料都有编号锚点（[M1]/[M2]/...）。当某张
+  截图是数据图表、看板或界面截图、原图比文字描述更有说服力时，在对应
+  段落单独一行插入占位符 [[IMG:M1]]（锚点必须与材料编号一致），并配
+  一句简短图注；被插图的截图不要再大段复述其中的数据。只允许引用
+  kind 为 image 的材料，最多插图 4 张。
 - 输出固定四段式 Markdown，不要输出其他任何内容：
 
 # 工作日报 · {author} · {date}
@@ -131,20 +142,27 @@ class DailyReportService:
         await self.db.flush()
 
         try:
-            source_docs = await self._get_source_documents(
-                user_id=user.id, space_id=space_id, report_date=report_date
+            buffer_materials = await DailyMaterialService().list_materials_with_content(
+                user_id=user.id, day=report_date
             )
-            if not source_docs:
+            if not buffer_materials:
                 raise ValidationException(
-                    f"{report_date.isoformat()} 当天没有已入库的工作材料，"
-                    "请先上传截图、日志或文档"
+                    f"{report_date.isoformat()} 今日缓冲区没有工作材料，"
+                    "请先在今日工作台上传截图、日志或文档"
                 )
 
-            materials = await self._collect_materials(source_docs)
+            # 给每份材料一个编号锚点（M1/M2/...），供 LLM 在日报中插图引用
+            anchored = [
+                (f"M{i}", m) for i, m in enumerate(buffer_materials, start=1)
+            ]
+            materials = await self._collect_materials(anchored)
             content = await self._synthesize(user, report_date, materials)
+            # 图文并茂：把 LLM 标记的 [[IMG:Mn]] 占位符替换为真实图片链接；
+            # 被引用的截图从缓冲区转存 MinIO 长期保存（缓冲区本身 24h 过期）
+            content = await self._embed_images(report, content, dict(anchored))
 
             report.content = content
-            report.source_document_ids = [str(d.id) for d in source_docs]
+            report.source_document_ids = [m["id"] for m in buffer_materials]
             report.title = self._build_title(user, report_date)
             report.status = DailyReportStatus.completed
             report.generated_at = datetime.now(timezone.utc)
@@ -241,62 +259,45 @@ class DailyReportService:
             await self.require_space_manager(requester, report.space_id)
         return report
 
-    # ─── 内部：材料聚合 ────────────────────────────────────────────────
+    # ─── 内部：材料聚合（Redis 缓冲区） ───────────────────────────────
 
-    async def _get_source_documents(
-        self, *, user_id: uuid.UUID, space_id: uuid.UUID, report_date: date
-    ) -> list[Document]:
-        """捞出员工当日上传且处理完成的原始材料文档。
+    async def _collect_materials(self, anchored: list[tuple[str, dict]]) -> str:
+        """把缓冲区材料整理成 LLM 输入文本。
 
-        排除两类文档：
-        - 标题以「工作日报」开头的回流日报（避免自引用污染）；
-        - 已被任意日报引用过的回流文档（双保险，按 document_id 排除）。
+        - 每份材料带编号锚点（[M1]/[M2]/...），LLM 插图时引用；
+        - text 类：直接 UTF-8 解码，按均摊预算截断；
+        - image 类：调用多模态 LLM 识别截图内容（单张失败降级为占位说明，
+          不阻塞整份日报）；
+        - other 类：仅记录文件名，提示内容未解析。
         """
-        day_start = datetime.combine(report_date, time.min, tzinfo=timezone.utc)
-        day_end = datetime.combine(report_date, time.max, tzinfo=timezone.utc)
-
-        report_doc_ids = select(DailyReport.document_id).where(
-            DailyReport.space_id == space_id,
-            DailyReport.document_id.is_not(None),
-        )
-
-        stmt = (
-            select(Document)
-            .where(
-                Document.space_id == space_id,
-                Document.uploaded_by == user_id,
-                Document.status == DocumentStatus.completed,
-                Document.created_at >= day_start,
-                Document.created_at <= day_end,
-                ~Document.title.startswith(REPORT_TITLE_PREFIX),
-                ~Document.id.in_(report_doc_ids),
-            )
-            .order_by(Document.created_at.asc())
-        )
-        rows = (await self.db.execute(stmt)).scalars().all()
-        return list(rows)
-
-    async def _collect_materials(self, documents: list[Document]) -> str:
-        """从 OpenSearch 取回各文档正文片段，拼成 LLM 输入材料。
-
-        OpenSearch 客户端是同步的，用 ``asyncio.to_thread`` 避免阻塞事件循环
-        （与 search_service 中的处理方式一致）。
-        """
-        doc_ids = [str(d.id) for d in documents]
-        chunks_by_doc = await asyncio.to_thread(
-            self._fetch_chunks_sync, doc_ids, MAX_CHUNKS_PER_DOCUMENT
-        )
-
-        per_doc_budget = max(
-            500, min(MAX_CHARS_PER_DOCUMENT, MAX_TOTAL_MATERIAL_CHARS // max(len(documents), 1))
+        per_material_budget = max(
+            500,
+            min(MAX_CHARS_PER_MATERIAL, MAX_TOTAL_MATERIAL_CHARS // max(len(anchored), 1)),
         )
         sections: list[str] = []
         total = 0
-        for doc in documents:
-            text = "\n".join(chunks_by_doc.get(str(doc.id), []))[:per_doc_budget]
+        image_count = 0
+        for anchor, m in anchored:
+            uploaded_hm = (m.get("uploaded_at") or "")[11:16]
+            header = (
+                f"### 材料 [{anchor}]：{m['filename']}"
+                f"（{m['kind']}，上传于 {uploaded_hm} UTC）"
+            )
+
+            if m["kind"] == "text":
+                text = DailyMaterialService.extract_text(m, per_material_budget)
+            elif m["kind"] == "image":
+                if image_count >= MAX_IMAGES_PER_REPORT:
+                    text = "（截图数量超出单次合成上限，未识别内容）"
+                else:
+                    image_count += 1
+                    text = await self._describe_image(m)
+            else:
+                text = "（暂不支持解析该文件类型，仅记录文件名）"
+
             if not text.strip():
                 continue
-            section = f"### 材料：{doc.title}（{doc.file_type}，上传于 {doc.created_at:%H:%M}）\n{text}"
+            section = f"{header}\n{text}"
             if total + len(section) > MAX_TOTAL_MATERIAL_CHARS:
                 break
             sections.append(section)
@@ -304,34 +305,102 @@ class DailyReportService:
 
         if not sections:
             raise ValidationException(
-                "当日材料尚未完成索引或内容为空，请稍后重试"
+                "缓冲区材料内容为空或无法解析，请重新上传文本/截图材料"
             )
         return "\n\n".join(sections)
 
-    @staticmethod
-    def _fetch_chunks_sync(
-        document_ids: list[str], max_chunks_per_doc: int
-    ) -> dict[str, list[str]]:
-        """同步查询 OpenSearch，按 document_id 分组返回 chunk 正文。"""
-        client = get_opensearch_client()
-        result: dict[str, list[str]] = {doc_id: [] for doc_id in document_ids}
-        size = min(1000, max_chunks_per_doc * max(len(document_ids), 1))
-        resp = client.search(
-            index=INDEX_NAME,
-            body={
-                "size": size,
-                "_source": ["document_id", "content"],
-                "query": {"terms": {"document_id": document_ids}},
-            },
-        )
-        for hit in resp.get("hits", {}).get("hits", []):
-            src = hit.get("_source", {})
-            doc_id = src.get("document_id")
-            content = src.get("content") or ""
-            if doc_id in result and content.strip():
-                if len(result[doc_id]) < max_chunks_per_doc:
-                    result[doc_id].append(content.strip())
-        return result
+    async def _describe_image(self, material: dict) -> str:
+        """多模态识别截图内容；任何失败都降级为占位说明。"""
+        data = DailyMaterialService.material_bytes(material)
+        mime = material.get("content_type") or "image/png"
+        gateway = LLMGateway(timeout=120)
+        try:
+            resp = await asyncio.wait_for(
+                gateway.complete_multimodal(
+                    prompt=(
+                        "这是一张员工的工作截图。请客观描述截图中的内容："
+                        "涉及的系统/界面/模块名称、可见的文字要点、数据指标、"
+                        "代码或报错信息等。只陈述截图里能看到的内容，"
+                        "不要推测，200 字以内。"
+                    ),
+                    images=[data],
+                    image_mime_type=mime,
+                    max_tokens=1024,
+                ),
+                timeout=IMAGE_DESCRIBE_TIMEOUT,
+            )
+            content = (resp.content or "").strip()
+            if content:
+                return f"【截图内容识别】{content}"
+        except Exception as exc:  # noqa: BLE001 — 单张失败不阻塞日报
+            logger.warning(
+                "daily report image describe failed: material=%s error=%s",
+                material.get("id"),
+                exc,
+            )
+        return "（截图内容识别失败，仅记录截图文件名）"
+
+    # ─── 内部：图文并茂（图片转存与链接替换） ─────────────────────────
+
+    async def _embed_images(
+        self,
+        report: DailyReport,
+        content: str,
+        materials_by_anchor: dict[str, dict],
+    ) -> str:
+        """把日报中的 ``[[IMG:Mn]]`` 占位符替换为真实图片链接。
+
+        被引用的截图从 Redis 缓冲区转存到 MinIO（``report-assets/{日报ID}/``），
+        与日报一样长期留存——缓冲区本身 24h 过期，不转存图片会裂图。
+        未命中材料 / 非图片 / 转存失败的占位符一律清除，不留残渣。
+        """
+        refs = IMG_PLACEHOLDER_RE.findall(content)
+        if not refs:
+            return content
+
+        client = get_minio_client()
+        ensure_bucket_exists()
+        for anchor in dict.fromkeys(refs):  # 去重且保留出现顺序
+            placeholder = f"[[IMG:{anchor}]]"
+            record = materials_by_anchor.get(anchor)
+            if not record or record.get("kind") != "image":
+                logger.info("report image placeholder unresolved: %s", anchor)
+                content = content.replace(placeholder, "")
+                continue
+
+            ext = record["filename"].rsplit(".", 1)[-1].lower() if "." in record["filename"] else "png"
+            storage_key = f"report-assets/{report.id}/{record['id']}.{ext}"
+            try:
+                client.upload_fileobj(
+                    Fileobj=io.BytesIO(DailyMaterialService.material_bytes(record)),
+                    Bucket=settings.MINIO_BUCKET,
+                    Key=storage_key,
+                    ExtraArgs={
+                        "ContentType": record.get("content_type") or "image/png"
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "report asset persist failed: report=%s material=%s",
+                    report.id,
+                    record.get("id"),
+                    exc_info=True,
+                )
+                content = content.replace(placeholder, "")
+                continue
+
+            image_md = (
+                f"![{record['filename']}]"
+                f"(/api/reports/{report.id}/assets/{record['id']})"
+            )
+            content = content.replace(placeholder, image_md)
+            logger.info(
+                "report asset embedded: report=%s material=%s key=%s",
+                report.id,
+                record["id"],
+                storage_key,
+            )
+        return content
 
     # ─── 内部：LLM 合成 ────────────────────────────────────────────────
 

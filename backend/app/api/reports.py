@@ -4,28 +4,34 @@
 - ``GET  /api/reports/my``：员工查看自己的历史日报
 - ``GET  /api/reports/team``：主管查看空间内全员日报（空间创建者/管理员）
 - ``GET  /api/reports/{report_id}``：查看单份日报（本人或空间主管）
+- ``GET  /api/reports/{report_id}/assets/{material_id}``：日报内嵌图片附件
 
 鉴权：全员接口依赖 :func:`get_current_user`；越权防护在
 :class:`DailyReportService` 内完成——员工生成自己的日报需要空间 write
 权限（与上传材料一致），「全员视图」要求空间创建者（主管）或系统管理员，
-普通成员无法查看他人日报。
+普通成员无法查看他人日报。图片附件与日报详情同一权限口径。
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.exceptions import NotFoundException
+from app.core.minio import get_minio_client
 from app.models.daily_report import DailyReport
 from app.models.user import User
 from app.services.report_service import DailyReportService
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 router = APIRouter(tags=["reports"])
 
@@ -175,3 +181,42 @@ async def get_report(
         requester=current_user, report_id=uuid.UUID(report_id)
     )
     return _to_response(report)
+
+
+@router.get("/api/reports/{report_id}/assets/{material_id}")
+async def get_report_asset(
+    report_id: str,
+    material_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """获取日报内嵌的图片附件（图文并茂）。
+
+    图片在日报生成时从缓冲区转存到 MinIO（``report-assets/{日报ID}/``），
+    长期保存；权限口径与查看日报一致（本人或空间主管）。
+    """
+    service = DailyReportService(db)
+    # 复用日报查看权限（本人或空间主管），越权会在这里抛 403/404
+    await service.get_report(requester=current_user, report_id=uuid.UUID(report_id))
+
+    client = get_minio_client()
+    prefix = f"report-assets/{report_id}/{material_id}."
+    listing = await asyncio.to_thread(
+        client.list_objects_v2,
+        Bucket=settings.MINIO_BUCKET,
+        Prefix=prefix,
+        MaxKeys=1,
+    )
+    contents = listing.get("Contents") or []
+    if not contents:
+        raise NotFoundException("ReportAsset", material_id)
+
+    obj = await asyncio.to_thread(
+        client.get_object, Bucket=settings.MINIO_BUCKET, Key=contents[0]["Key"]
+    )
+    data = await asyncio.to_thread(obj["Body"].read)
+    return Response(
+        content=data,
+        media_type=obj.get("ContentType") or "image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )

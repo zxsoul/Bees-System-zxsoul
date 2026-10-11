@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select
 
@@ -53,8 +53,9 @@ def auto_generate_daily_reports(target_date: str | None = None) -> dict:
     """
     from app.core.database import AsyncSessionLocal
     from app.models.daily_report import DailyReport, DailyReportStatus
-    from app.models.document import Document, DocumentStatus
+    from app.models.permission import AccessLevel, Permission, ResourceType
     from app.models.user import User
+    from app.services.daily_material_service import DailyMaterialService
     from app.services.report_service import DailyReportService
 
     day = (
@@ -62,72 +63,70 @@ def auto_generate_daily_reports(target_date: str | None = None) -> dict:
         if target_date
         else datetime.now(timezone.utc).date()
     )
-    day_start = datetime.combine(day, time.min, tzinfo=timezone.utc)
-    day_end = datetime.combine(day, time.max, tzinfo=timezone.utc)
 
     async def _run() -> dict:
         summary = {"date": day.isoformat(), "generated": 0, "skipped": 0, "errors": []}
-        async with AsyncSessionLocal() as session:
-            # 找出当天有「已完成入库」上传记录的 (space_id, uploaded_by) 组合
-            stmt = (
-                select(Document.space_id, Document.uploaded_by)
-                .where(
-                    Document.status == DocumentStatus.completed,
-                    Document.created_at >= day_start,
-                    Document.created_at <= day_end,
-                )
-                .distinct()
-            )
-            pairs = (await session.execute(stmt)).all()
+        # 缓冲区与空间解耦：先找「今天个人缓冲区有材料」的用户，
+        # 再对该用户拥有写权限的每个空间分别生成日报（日报仍按空间归档）。
+        user_ids = await DailyMaterialService().iter_active_users(day)
 
-        for space_id, user_id in pairs:
+        for user_id in user_ids:
             async with AsyncSessionLocal() as session:
-                try:
-                    # 已有完成的日报则跳过（幂等；force 重算走 API）
-                    existing = await session.execute(
-                        select(DailyReport).where(
-                            DailyReport.space_id == space_id,
-                            DailyReport.user_id == user_id,
-                            DailyReport.report_date == day,
-                            DailyReport.status == DailyReportStatus.completed,
-                        )
-                    )
-                    if existing.scalar_one_or_none():
-                        summary["skipped"] += 1
-                        continue
+                perm_stmt = select(Permission.resource_id).where(
+                    Permission.user_id == user_id,
+                    Permission.resource_type == ResourceType.space,
+                    Permission.access_level == AccessLevel.write,
+                )
+                space_ids = list((await session.execute(perm_stmt)).scalars().all())
 
-                    user = (
-                        await session.execute(
-                            select(User).where(User.id == user_id)
+            for space_id in space_ids:
+                async with AsyncSessionLocal() as session:
+                    try:
+                        # 已有完成的日报则跳过（幂等；force 重算走 API）
+                        existing = await session.execute(
+                            select(DailyReport).where(
+                                DailyReport.space_id == space_id,
+                                DailyReport.user_id == user_id,
+                                DailyReport.report_date == day,
+                                DailyReport.status == DailyReportStatus.completed,
+                            )
                         )
-                    ).scalar_one_or_none()
-                    if not user:
-                        continue
+                        if existing.scalar_one_or_none():
+                            summary["skipped"] += 1
+                            continue
 
-                    service = DailyReportService(session)
-                    await service.generate_daily_report(
-                        user=user,
-                        space_id=space_id,
-                        report_date=day,
-                        force=False,
-                    )
-                    summary["generated"] += 1
-                except Exception as exc:  # noqa: BLE001 — 单人失败不阻塞其他人
-                    logger.warning(
-                        "auto daily report failed: space=%s user=%s error=%s",
-                        space_id,
-                        user_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    summary["errors"].append(
-                        {
-                            "space_id": str(space_id),
-                            "user_id": str(user_id),
-                            "error": str(exc)[:500],
-                        }
-                    )
-                    await session.rollback()
+                        user = (
+                            await session.execute(
+                                select(User).where(User.id == user_id)
+                            )
+                        ).scalar_one_or_none()
+                        if not user:
+                            continue
+
+                        service = DailyReportService(session)
+                        await service.generate_daily_report(
+                            user=user,
+                            space_id=space_id,
+                            report_date=day,
+                            force=False,
+                        )
+                        summary["generated"] += 1
+                    except Exception as exc:  # noqa: BLE001 — 单人失败不阻塞其他人
+                        logger.warning(
+                            "auto daily report failed: space=%s user=%s error=%s",
+                            space_id,
+                            user_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        summary["errors"].append(
+                            {
+                                "space_id": str(space_id),
+                                "user_id": str(user_id),
+                                "error": str(exc)[:500],
+                            }
+                        )
+                        await session.rollback()
         return summary
 
     return _run_async(_run())
