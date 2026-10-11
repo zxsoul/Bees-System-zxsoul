@@ -27,6 +27,16 @@ export default function Home() {
           进入应用
         </Link>
       </div>
+      <footer className="mt-auto pt-8 text-center text-xs text-muted-foreground">
+        <a
+          href="https://beian.miit.gov.cn/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hover:text-foreground"
+        >
+          鲁ICP备2026059905号
+        </a>
+      </footer>
     </main>
   );
 }

@@ -326,8 +326,7 @@ services:
     container_name: wikforge-frontend
     environment:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
-    ports:
-      - "${FRONTEND_PORT:-80}:3000"
+    # 端口不再直接暴露到宿主机, 统一由 caddy 反向代理 (80/443)
     depends_on:
       api:
         condition: service_healthy
@@ -338,12 +337,30 @@ services:
       retries: 3
     restart: unless-stopped
 
+  # --- 反向代理 / HTTPS (Caddy 自动申请并续期 Let's Encrypt 证书) ---
+
+  caddy:
+    image: caddy:2
+    container_name: wikforge-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   opensearch_data:
   qdrant_data:
   minio_data:
   redis_data:
+  caddy_data:
   flower_data:
   # 共享 huggingface / surya / marker 模型缓存,
   # 避免 worker 每次重启都重新下载 ~2GB 模型
