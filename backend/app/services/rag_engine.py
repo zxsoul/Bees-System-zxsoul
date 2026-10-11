@@ -54,7 +54,7 @@ class RAGConfig:
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD
     llm_timeout: float = DEFAULT_LLM_TIMEOUT
     model: str | None = None
-    temperature: float = 1
+    temperature: float = 0.1
     max_tokens: int = 4096
 
 

@@ -134,7 +134,7 @@ class TestFileFormatValidation:
         )
 
         mock_db.add.assert_called_once()
-        mock_client.put_object.assert_called_once()
+        mock_client.upload_fileobj.assert_called_once()
         added_doc = mock_db.add.call_args[0][0]
         assert added_doc.file_type == "pdf"
         assert added_doc.status == DocumentStatus.pending

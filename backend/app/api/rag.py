@@ -67,7 +67,7 @@ class ChatRequest(BaseModel):
         default=None, description="LLM 模型（为空则使用默认模型）"
     )
     temperature: float = Field(
-        default=1, ge=0.0, le=2.0, description="LLM 温度参数"
+        default=0.1, ge=0.0, le=2.0, description="LLM 温度参数"
     )
 
 

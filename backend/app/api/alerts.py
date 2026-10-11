@@ -138,10 +138,14 @@ async def acknowledge_alert(
     # 先查出预警拿到 space_id 做权限校验
     from sqlalchemy import select
 
-    from app.models.progress_alert import ProgressAlert as PA
+    from app.models.progress_alert import ProgressAlert
 
     row = (
-        await db.execute(select(PA).where(PA.id == uuid.UUID(alert_id)))
+        await db.execute(
+            select(ProgressAlert).where(
+                ProgressAlert.id == uuid.UUID(alert_id)
+            )
+        )
     ).scalar_one_or_none()
     if row is None:
         from app.core.exceptions import NotFoundException

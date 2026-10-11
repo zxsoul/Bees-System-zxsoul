@@ -60,6 +60,10 @@ class FakeRAGEngine:
         self._tokens = tokens or ["你", "好"]
         self._sessions = sessions or {}
         self._histories = histories or {}
+        # 路由层还会读取 last_session_id / last_citations 生成 done/citations 事件,
+        # 替身需提供这两个属性
+        self.last_session_id: str | None = None
+        self.last_citations: list = []
         # 调用记录用于断言：[(question, session_id, user_id, allowed_space_ids)]
         self.chat_calls: list[tuple[str, str | None, str, list[str]]] = []
 
@@ -213,9 +217,9 @@ class TestRAGChatRoute:
             body = resp.read().decode("utf-8")
 
         events = _parse_sse(body)
-        # 最后一个事件必为 done，前面是若干 token
+        # 最后一个事件必为 done, token 之后带 citations 事件
         kinds = [e["type"] for e in events]
-        assert kinds == ["token", "token", "token", "done"]
+        assert kinds == ["token", "token", "token", "citations", "done"]
 
         token_texts = [e["content"] for e in events if e["type"] == "token"]
         assert token_texts == ["你", "好", "！"]

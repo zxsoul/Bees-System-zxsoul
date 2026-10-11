@@ -110,6 +110,8 @@ class TestUniversalParserScaffolding:
         mock_settings.return_value = MagicMock(
             CHAT_MODEL="gpt-4o",
             QUALITY_FALLBACK_THRESHOLD=0.7,
+            # MagicMock 未声明的属性会被 float() 转成 1.0, 必须显式给出
+            UNIVERSAL_PARSER_PAGE_TIMEOUT=120.0,
         )
         gateway = MagicMock(spec=LLMGateway)
 
@@ -117,13 +119,16 @@ class TestUniversalParserScaffolding:
 
         assert parser.llm is gateway
         assert parser.model == "gpt-4o"
-        assert parser.page_timeout == 60.0
+        assert parser.page_timeout == 120.0
 
     @patch("app.services.universal_parser.LLMGateway")
     @patch("app.services.universal_parser.get_settings")
     def test_constructor_creates_default_gateway(self, mock_settings, mock_gateway_cls):
         """未传入 gateway 时，使用 Settings 中的默认模型创建 LLMGateway。"""
-        mock_settings.return_value = MagicMock(CHAT_MODEL="qwen-vl-max")
+        mock_settings.return_value = MagicMock(
+            CHAT_MODEL="qwen-vl-max",
+            UNIVERSAL_PARSER_PAGE_TIMEOUT=120.0,
+        )
         sentinel_gateway = MagicMock(spec=LLMGateway)
         mock_gateway_cls.return_value = sentinel_gateway
 
@@ -132,7 +137,7 @@ class TestUniversalParserScaffolding:
         # 默认模型来自 settings
         assert parser.model == "qwen-vl-max"
         # 默认走 LLMGateway 工厂构造，并把模型 / 超时透传过去
-        mock_gateway_cls.assert_called_once_with(model="qwen-vl-max", timeout=60.0)
+        mock_gateway_cls.assert_called_once_with(model="qwen-vl-max", timeout=120.0)
         assert parser.llm is sentinel_gateway
 
     @patch("app.services.universal_parser.get_settings")
@@ -1555,8 +1560,9 @@ class TestParsePageTimeoutAndErrors:
         parser, gateway = _make_parse_page_parser(page_timeout=0.05)
 
         async def slow_call(*_args, **_kwargs):
-            # 故意 sleep 远长于配置的 page_timeout，强制 asyncio.wait_for 触发 TimeoutError
-            await asyncio.sleep(0.5)
+            # 故意 sleep 远长于 page_timeout 下限(1s), 强制 asyncio.wait_for 触发 TimeoutError
+            # 注: 构造函数对 page_timeout 有 max(..., 1.0) 下限保护, 0.05 会被抬到 1.0
+            await asyncio.sleep(2.0)
             return LLMResponse(content="late", model="gpt-4o")
 
         gateway.complete_multimodal.side_effect = slow_call
