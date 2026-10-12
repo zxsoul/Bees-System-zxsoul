@@ -117,6 +117,10 @@ class DailyMaterialService:
             raise ValueError(f"当日材料已达上限（{MAX_MATERIALS_PER_DAY} 份）")
 
         material_id = uuid.uuid4().hex
+        kind = classify_material(filename, content_type)
+        # 预处理字段：image/other 上传后由 Celery 异步识别（desc_status
+        # pending → processing → done/failed），生成日报时直接取用结果，
+        # 不再每次生成重复调用视觉模型。text 类本地解码零成本，直接 done。
         record = {
             "id": material_id,
             "user_id": str(user_id),
@@ -124,9 +128,16 @@ class DailyMaterialService:
             "filename": filename,
             "content_type": content_type or "application/octet-stream",
             "size": len(data),
-            "kind": classify_material(filename, content_type),
+            "kind": kind,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "content_b64": base64.b64encode(data).decode("ascii"),
+            "desc_status": "done" if kind == "text" else "pending",
+            "ai_description": None,
+            "extracted_text": (
+                data.decode("utf-8", errors="replace")[:8000]
+                if kind == "text"
+                else None
+            ),
         }
 
         await redis.set(
@@ -185,6 +196,41 @@ class DailyMaterialService:
         """从文本类材料中提取可读内容（UTF-8 解码，容错替换）。"""
         data = DailyMaterialService.material_bytes(record)
         return data.decode("utf-8", errors="replace")[:max_chars]
+
+    # ─── 异步识别结果写回 ──────────────────────────────────────────────
+
+    async def update_analysis(
+        self,
+        material_id: str,
+        *,
+        desc_status: str,
+        ai_description: str | None = None,
+        extracted_text: str | None = None,
+    ) -> bool:
+        """把异步识别结果写回材料记录（image 描述 / other 文本提取）。
+
+        供 Celery 识别任务调用；材料已过期或被删除时返回 False。
+        """
+        redis = await get_redis()
+        key = _item_key(material_id)
+        raw = await redis.get(key)
+        if not raw:
+            return False
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+
+        record["desc_status"] = desc_status
+        if ai_description is not None:
+            record["ai_description"] = ai_description
+        if extracted_text is not None:
+            record["extracted_text"] = extracted_text
+
+        # 保留原 TTL：读剩余过期时间再写回，避免识别结果刷新材料寿命
+        ttl = await redis.ttl(key)
+        await redis.set(key, json.dumps(record), ex=max(ttl, 60))
+        return True
 
     # ─── 删除 ─────────────────────────────────────────────────────────
 

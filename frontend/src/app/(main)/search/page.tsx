@@ -64,6 +64,8 @@ export default function SearchPage() {
   const navigateToDocument = (result: SearchResult) => {
     const params = new URLSearchParams({
       highlight: String(result.chunk_index),
+      // 记录来源，文档详情页「返回」可回到搜索结果页
+      from: "/search",
     });
     window.location.href = `/documents/${result.document_id}?${params.toString()}`;
   };

@@ -1062,6 +1062,10 @@ def _make_parser(dpi: int = 150, lo_timeout: int = 60) -> UniversalParser:
             QUALITY_FALLBACK_THRESHOLD=0.7,
             UNIVERSAL_PARSER_PAGE_DPI=dpi,
             UNIVERSAL_PARSER_LIBREOFFICE_TIMEOUT=lo_timeout,
+            # 这些用例聚焦 LLM 逐页行为（失败/降级），关闭方案 C 的
+            # 文字页闸门与视觉页数上限，保证每页都走 LLM 路径。
+            UNIVERSAL_PARSER_TEXT_PAGE_MIN_CHARS=10**9,
+            UNIVERSAL_PARSER_MAX_VISION_PAGES=10**9,
         )
         gateway = MagicMock(spec=LLMGateway)
         return UniversalParser(llm_gateway=gateway)
@@ -2614,7 +2618,8 @@ class TestPartialFailureDegradation:
             metadata={"file_type": "pdf"},
         )
 
-        parser = UniversalParser(llm_gateway=gateway)
+        # 关闭方案 C 文字页闸门：本用例聚焦「全页 LLM 失败 → 整文降级」。
+        parser = UniversalParser(llm_gateway=gateway, text_page_min_chars=10**9)
         result = await parser.parse(doc)
 
         # 全页失败 → 旧降级形状：仅有 paragraph 块、无 heading
@@ -2649,7 +2654,12 @@ class TestPartialFailureDegradation:
             metadata={"file_type": "pdf"},
         )
 
-        parser = UniversalParser(llm_gateway=gateway, fallback_chunk_chars=500)
+        # 关闭方案 C 文字页闸门：本用例聚焦「失败页按 fallback_chunk_chars 降级」。
+        parser = UniversalParser(
+            llm_gateway=gateway,
+            fallback_chunk_chars=500,
+            text_page_min_chars=10**9,
+        )
         result = await parser.parse(doc)
 
         page1_paras = [

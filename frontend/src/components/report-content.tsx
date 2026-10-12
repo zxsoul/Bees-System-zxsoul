@@ -9,11 +9,23 @@
  * 本地 ObjectURL 显示。
  */
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { fetchApiBlob } from "@/lib/daily-materials-api";
+
+// 模块级常量：components 对象必须稳定。若内联在渲染里，每次父组件
+// 重渲染都会生成新函数 → React 卸载重挂载 AuthImage → 图片重复拉取
+// blob 并在「占位 → 图片」之间切换，造成页面上下抖动。
+const MARKDOWN_COMPONENTS = {
+  img: (props: { src?: unknown; alt?: string }) => (
+    <AuthImage
+      src={typeof props.src === "string" ? props.src : undefined}
+      alt={props.alt}
+    />
+  ),
+};
 
 function AuthImage({ src, alt }: { src?: string; alt?: string }) {
   const [url, setUrl] = useState<string | null>(null);
@@ -63,22 +75,19 @@ function AuthImage({ src, alt }: { src?: string; alt?: string }) {
   );
 }
 
-export function ReportContent({ content }: { content: string }) {
+export const ReportContent = memo(function ReportContent({
+  content,
+}: {
+  content: string;
+}) {
   return (
     <article className="prose prose-sm max-w-none dark:prose-invert">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{
-          img: (props) => (
-            <AuthImage
-              src={typeof props.src === "string" ? props.src : undefined}
-              alt={props.alt}
-            />
-          ),
-        }}
+        components={MARKDOWN_COMPONENTS}
       >
         {content}
       </ReactMarkdown>
     </article>
   );
-}
+});

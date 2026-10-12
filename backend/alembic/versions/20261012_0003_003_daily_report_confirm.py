@@ -34,8 +34,8 @@ def upgrade() -> None:
         "daily_reports",
         sa.Column("confirmed_at", sa.DateTime(timezone=True), nullable=True),
     )
-    # 存量 completed 日报按「已确认入库」回填
-    op.execute("UPDATE daily_reports SET confirmed = true WHERE status = 'completed'")
+    # 存量日报回填：completed 视为已确认入库，其余（generating/failed）为草稿
+    op.execute("UPDATE daily_reports SET confirmed = (status = 'completed')")
     op.alter_column(
         "daily_reports",
         "confirmed",

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
@@ -21,6 +22,8 @@ from app.api.auth import get_current_user
 from app.core.exceptions import ForbiddenException, NotFoundException, ValidationException
 from app.models.user import User
 from app.services.daily_material_service import DailyMaterialService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["daily-materials"])
 
@@ -37,6 +40,11 @@ class DailyMaterialResponse(BaseModel):
     size: int
     kind: str  # text / image / other
     uploaded_at: str
+    # 异步识别状态：pending/processing/done/failed（text 类上传即 done）
+    desc_status: str = "pending"
+    # 识别结果（图片的 AI 描述 / 文档提取文本），供前端展示与人工核对
+    ai_description: str | None = None
+    extracted_text: str | None = None
 
 
 class DailyMaterialListResponse(BaseModel):
@@ -63,7 +71,11 @@ async def upload_material(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    """上传一份今日工作材料到我的缓冲区（仅暂存，与空间无关）。"""
+    """上传一份今日工作材料到我的缓冲区（仅暂存，与空间无关）。
+
+    图片 / 文档类材料上传成功后立即投递异步识别任务（后台预处理），
+    生成日报时直接使用识别结果，无需等待逐张识别。
+    """
     data = await file.read()
     service = DailyMaterialService()
     try:
@@ -75,6 +87,19 @@ async def upload_material(
         )
     except ValueError as exc:
         raise ValidationException(str(exc)) from exc
+
+    # 上传即预处理：image 走视觉识别，other 走文本提取；text 类无需任务
+    if meta["kind"] in ("image", "other"):
+        try:
+            from app.core.celery_app import celery_app
+
+            celery_app.send_task("daily_materials.analyze", args=[meta["id"]])
+        except Exception as exc:  # noqa: BLE001 - 投递失败不阻塞上传
+            logger.warning(
+                "daily material analyze dispatch failed: id=%s error=%s",
+                meta["id"],
+                exc,
+            )
     return meta
 
 

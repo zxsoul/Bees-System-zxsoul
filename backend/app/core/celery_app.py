@@ -30,6 +30,7 @@ TASK_MODULES = [
     "app.tasks.permission_tasks",
     "app.tasks.watchdog",
     "app.tasks.report_tasks",
+    "app.tasks.daily_material_tasks",
 ]
 
 celery_app = Celery(

@@ -174,6 +174,8 @@ class UniversalParser:
         page_timeout: float | None = None,
         max_raw_text_chars: int | None = None,
         fallback_chunk_chars: int | None = None,
+        text_page_min_chars: int | None = None,
+        max_vision_pages: int | None = None,
     ):
         """Initialize the Universal Parser.
 
@@ -279,6 +281,22 @@ class UniversalParser:
                 getattr(settings, "UNIVERSAL_PARSER_FALLBACK_CHUNK_CHARS", FALLBACK_CHUNK_SIZE)
             )
         self.fallback_chunk_chars = max(fallback_chunk_chars, 1)
+
+        # 方案 C（混合解析）：单页原始文本 ≥ 该阈值时跳过视觉调用，
+        # 直接以原文作为该页内容（扫描件里夹着的正常文字页不花 token）。
+        # 与 max_raw_text_chars 一致：显式参数优先，供测试/专用 Profile 覆盖。
+        if text_page_min_chars is None:
+            text_page_min_chars = int(
+                getattr(settings, "UNIVERSAL_PARSER_TEXT_PAGE_MIN_CHARS", 200)
+            )
+        self._text_page_min_chars = max(text_page_min_chars, 0)
+        # 方案 C：单文档视觉解析页数上限，超出后剩余页走原文/降级路径，
+        # 限制单文档的 LLM 成本上限。
+        if max_vision_pages is None:
+            max_vision_pages = int(
+                getattr(settings, "UNIVERSAL_PARSER_MAX_VISION_PAGES", 50)
+            )
+        self._max_vision_pages = max(max_vision_pages, 1)
 
         # Per-`parse()` cache: maps source Office file path → converted PDF path.
         # Avoids invoking LibreOffice once per page on multi-page documents.
@@ -404,14 +422,40 @@ class UniversalParser:
         """
         page_results: list[PageResult] = []
         page_errors: dict[int, str] = {}
+        vision_pages_used = 0
 
         with self._office_pdf_scope():
             for page_num in sorted(pages.keys()):
                 page_blocks = pages[page_num]
                 raw_text = "\n".join(b.text for b in page_blocks if b.text.strip())
+
+                # 方案 C·混合解析：本页文字层达标时跳过视觉调用（也省去
+                # 页面光栅化开销），直接以本地解析原文作为该页内容。
+                if len(raw_text.strip()) >= self._text_page_min_chars:
+                    page_results.append(
+                        PageResult(page_number=page_num, markdown=raw_text)
+                    )
+                    continue
+
+                # 方案 C·成本上限：整本视觉页数用尽后，有文字的页走原文、
+                # 无文字的页记为预算耗尽，由降级路径用原始 blocks 补齐。
+                if vision_pages_used >= self._max_vision_pages:
+                    if raw_text.strip():
+                        page_results.append(
+                            PageResult(page_number=page_num, markdown=raw_text)
+                        )
+                    else:
+                        logger.warning(
+                            "universal_parser page=%d reason=vision_budget_exceeded",
+                            page_num,
+                        )
+                        page_errors[page_num] = "vision_budget_exceeded"
+                    continue
+
                 page_image = self._get_page_image(parsed_doc, page_num)
 
                 try:
+                    vision_pages_used += 1
                     result = await self._parse_page(
                         page_number=page_num,
                         raw_text=raw_text,
@@ -434,6 +478,13 @@ class UniversalParser:
                         e,
                     )
                     page_errors[page_num] = "unknown"
+
+        if vision_pages_used:
+            logger.info(
+                "universal_parser vision budget: used=%d max=%d",
+                vision_pages_used,
+                self._max_vision_pages,
+            )
 
         return page_results, page_errors
 

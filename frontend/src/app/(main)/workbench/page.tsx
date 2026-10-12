@@ -169,6 +169,28 @@ export default function WorkbenchPage() {
     loadMaterials();
   }, [loadReports, loadMaterials]);
 
+  // 有「识别中」的材料时自动轮询，直到异步识别全部结束
+  useEffect(() => {
+    const hasAnalyzing = materials.some(
+      (m) =>
+        m.kind !== "text" &&
+        (m.desc_status === "pending" || m.desc_status === "processing")
+    );
+    if (!hasAnalyzing) return;
+    const timer = setInterval(() => {
+      dailyMaterialsApi
+        .list()
+        .then((list) =>
+          // 数据没变化时保持原引用，避免整页重渲染引起输入框抖动
+          setMaterials((prev) =>
+            JSON.stringify(prev) === JSON.stringify(list) ? prev : list
+          )
+        )
+        .catch(() => {});
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [materials]);
+
   const handleGenerate = async (opts?: {
     force?: boolean;
     adjustPrompt?: string;
@@ -300,6 +322,23 @@ export default function WorkbenchPage() {
                       {formatTime(m.uploaded_at)} 上传
                     </p>
                   </div>
+                  {/* 异步识别状态徽章（text 类无需识别，不显示） */}
+                  {m.kind !== "text" &&
+                    (m.desc_status === "pending" ||
+                    m.desc_status === "processing" ? (
+                      <span className="flex shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-700">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        识别中
+                      </span>
+                    ) : m.desc_status === "done" ? (
+                      <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">
+                        已识别
+                      </span>
+                    ) : (
+                      <span className="shrink-0 rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700">
+                        识别失败
+                      </span>
+                    ))}
                   <Button variant="ghost" size="sm" asChild>
                     <Link href={`/workbench/materials/${m.id}`}>
                       <Eye className="mr-1 h-4 w-4" />

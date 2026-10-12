@@ -27,13 +27,20 @@ from app.core.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+# 进程级持久事件循环：worker 子进程内复用同一 loop 跑所有任务。
+# 不能「每任务新建 loop 用完即关」——Redis/DB 客户端是全局单例，
+# 首次使用会绑定创建时的 loop；loop 关闭后，后续任务再用这些客户端
+# 会抛 RuntimeError: Event loop is closed（本项目已实际踩中）。
+_WORKER_LOOP: asyncio.AbstractEventLoop | None = None
+
+
 def _run_async(coro):
-    """在同步 Celery 任务里运行异步协程（与 pipeline.py 同一风格）。"""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    """在 worker 子进程的持久事件循环上运行异步协程。"""
+    global _WORKER_LOOP
+    if _WORKER_LOOP is None or _WORKER_LOOP.is_closed():
+        _WORKER_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_WORKER_LOOP)
+    return _WORKER_LOOP.run_until_complete(coro)
 
 
 @celery_app.task(

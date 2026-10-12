@@ -22,10 +22,13 @@ from app.services.llm_gateway import LLMGateway, LLMGatewayError
 logger = logging.getLogger(__name__)
 
 # Timeout constants
-REWRITE_TIMEOUT = 2.0  # seconds for query rewriting
-HYDE_TIMEOUT = 3.0  # seconds for HyDE generation
-DECOMPOSE_TIMEOUT = 2.0  # seconds for sub-query decomposition
-OVERALL_TIMEOUT = 5.0  # seconds for entire enhancement process
+# 原设计为 2s/3s/2s/5s，对思考型模型（如 kimi-k2.6，完整生成需 10s+）
+# 过于苛刻，实测全部超时降级；按真实延迟调大，均可被 Settings 的
+# QUERY_ENHANCEMENT_*_TIMEOUT 环境变量覆盖。
+REWRITE_TIMEOUT = 15.0  # seconds for query rewriting
+HYDE_TIMEOUT = 30.0  # seconds for HyDE generation
+DECOMPOSE_TIMEOUT = 15.0  # seconds for sub-query decomposition
+OVERALL_TIMEOUT = 35.0  # seconds for entire enhancement process
 
 # Limits
 MAX_REWRITE_VARIANTS = 5
@@ -41,11 +44,19 @@ class QueryEnhancerConfig:
         enable_rewrite: Whether to enable query rewriting (default True)
         enable_hyde: Whether to enable HyDE (default True)
         enable_decomposition: Whether to enable sub-query decomposition (default True)
+        rewrite_timeout: 改写子模块超时（秒），默认 5s
+        hyde_timeout: HyDE 子模块超时（秒），默认 8s
+        decompose_timeout: 子查询分解超时（秒），默认 5s
+        overall_timeout: 增强整体超时（秒），默认 10s
     """
 
     enable_rewrite: bool = True
     enable_hyde: bool = True
     enable_decomposition: bool = True
+    rewrite_timeout: float = REWRITE_TIMEOUT
+    hyde_timeout: float = HYDE_TIMEOUT
+    decompose_timeout: float = DECOMPOSE_TIMEOUT
+    overall_timeout: float = OVERALL_TIMEOUT
 
     @classmethod
     def from_settings(
@@ -58,6 +69,7 @@ class QueryEnhancerConfig:
         - ``QUERY_ENHANCEMENT_ENABLE_REWRITE`` → :attr:`enable_rewrite`
         - ``QUERY_ENHANCEMENT_ENABLE_HYDE`` → :attr:`enable_hyde`
         - ``QUERY_ENHANCEMENT_ENABLE_DECOMPOSITION`` → :attr:`enable_decomposition`
+        - ``QUERY_ENHANCEMENT_*_TIMEOUT`` → 各子模块与整体超时
 
         Args:
             settings: 可选注入，便于测试覆写。默认调用
@@ -82,6 +94,18 @@ class QueryEnhancerConfig:
             ),
             enable_decomposition=bool(
                 getattr(settings, "QUERY_ENHANCEMENT_ENABLE_DECOMPOSITION", True)
+            ),
+            rewrite_timeout=float(
+                getattr(settings, "QUERY_ENHANCEMENT_REWRITE_TIMEOUT", REWRITE_TIMEOUT)
+            ),
+            hyde_timeout=float(
+                getattr(settings, "QUERY_ENHANCEMENT_HYDE_TIMEOUT", HYDE_TIMEOUT)
+            ),
+            decompose_timeout=float(
+                getattr(settings, "QUERY_ENHANCEMENT_DECOMPOSE_TIMEOUT", DECOMPOSE_TIMEOUT)
+            ),
+            overall_timeout=float(
+                getattr(settings, "QUERY_ENHANCEMENT_OVERALL_TIMEOUT", OVERALL_TIMEOUT)
             ),
         )
 
@@ -163,9 +187,15 @@ class QueryEnhancer:
                              If None, a default instance will be created.
             config: Enhancement configuration. If None, all features enabled.
         """
-        self._llm = llm_gateway or LLMGateway(timeout=REWRITE_TIMEOUT)
-        self._embedding_service = embedding_service or EmbeddingService()
         self._config = config or QueryEnhancerConfig()
+        # 网关请求级超时取各子模块超时的最大值，避免网关先于 wait_for 超时。
+        gateway_timeout = max(
+            self._config.rewrite_timeout,
+            self._config.hyde_timeout,
+            self._config.decompose_timeout,
+        )
+        self._llm = llm_gateway or LLMGateway(timeout=gateway_timeout)
+        self._embedding_service = embedding_service or EmbeddingService()
 
     @property
     def config(self) -> QueryEnhancerConfig:
@@ -202,7 +232,7 @@ class QueryEnhancer:
         try:
             result = await asyncio.wait_for(
                 self._enhance_internal(query),
-                timeout=OVERALL_TIMEOUT,
+                timeout=self._config.overall_timeout,
             )
         except asyncio.TimeoutError:
             # 需求 7.5：整体超时降级。日志中带 ``event=query_enhancement_timeout``
@@ -210,7 +240,7 @@ class QueryEnhancer:
             logger.warning(
                 "event=query_enhancement_timeout timeout=%.1fs "
                 "Query enhancement timed out, falling back to original query",
-                OVERALL_TIMEOUT,
+                self._config.overall_timeout,
             )
             # 即便整体超时，也至少保留原始查询，满足需求 7.4 + 7.5
             return EnhancedQuery(
@@ -324,14 +354,17 @@ class QueryEnhancer:
         )
 
         try:
+            # 不传 temperature：思考型模型（如 kimi-k2.6）只接受 temperature=1，
+            # 传其它值会触发 400 + 参数降级重试，白白多一次失败往返。
+            # max_tokens 必须给足：思考型模型会先消耗推理 token，256/512
+            # 会被推理耗尽导致 content 为空。
             response = await asyncio.wait_for(
                 self._llm.complete(
                     prompt=prompt,
                     system_prompt=system_prompt,
-                    temperature=0.7,
-                    max_tokens=512,
+                    max_tokens=2048,
                 ),
-                timeout=REWRITE_TIMEOUT,
+                timeout=self._config.rewrite_timeout,
             )
 
             # Parse response: each line is a variant
@@ -339,7 +372,9 @@ class QueryEnhancer:
             return variants
 
         except asyncio.TimeoutError:
-            logger.warning(f"Query rewrite timed out after {REWRITE_TIMEOUT}s")
+            logger.warning(
+                f"Query rewrite timed out after {self._config.rewrite_timeout}s"
+            )
             return []
         except LLMGatewayError as e:
             logger.warning(f"Query rewrite LLM call failed: {e}")
@@ -370,14 +405,15 @@ class QueryEnhancer:
         )
 
         try:
+            # 不传 temperature（避免 400 降级重试）；max_tokens 给足以容纳
+            # 思考型模型的推理 token + 3 段假设文档。
             response = await asyncio.wait_for(
                 self._llm.complete(
                     prompt=prompt,
                     system_prompt=system_prompt,
-                    temperature=0.5,
-                    max_tokens=1024,
+                    max_tokens=3072,
                 ),
-                timeout=HYDE_TIMEOUT,
+                timeout=self._config.hyde_timeout,
             )
 
             # Parse hypothetical documents
@@ -398,7 +434,9 @@ class QueryEnhancer:
             return embeddings
 
         except asyncio.TimeoutError:
-            logger.warning(f"HyDE generation timed out after {HYDE_TIMEOUT}s")
+            logger.warning(
+                f"HyDE generation timed out after {self._config.hyde_timeout}s"
+            )
             return []
         except LLMGatewayError as e:
             logger.warning(f"HyDE LLM call failed: {e}")
@@ -433,14 +471,15 @@ class QueryEnhancer:
         )
 
         try:
+            # 不传 temperature（避免 400 降级重试）；max_tokens 给足以容纳
+            # 思考型模型的推理 token + 子查询列表。
             response = await asyncio.wait_for(
                 self._llm.complete(
                     prompt=prompt,
                     system_prompt=system_prompt,
-                    temperature=0.3,
-                    max_tokens=512,
+                    max_tokens=2048,
                 ),
-                timeout=DECOMPOSE_TIMEOUT,
+                timeout=self._config.decompose_timeout,
             )
 
             # Check if decomposition is needed
@@ -457,7 +496,9 @@ class QueryEnhancer:
             return sub_queries
 
         except asyncio.TimeoutError:
-            logger.warning(f"Query decomposition timed out after {DECOMPOSE_TIMEOUT}s")
+            logger.warning(
+                f"Query decomposition timed out after {self._config.decompose_timeout}s"
+            )
             return []
         except LLMGatewayError as e:
             logger.warning(f"Query decomposition LLM call failed: {e}")
@@ -621,8 +662,22 @@ def build_query_enhancer(
 
     Returns:
         按当前 Settings 配置开关的 :class:`QueryEnhancer` 实例。
+        若 ``FAST_CHAT_MODEL`` 已配置，增强用的 LLM 网关走快速模型；
+        否则回落到 ``CHAT_MODEL``。
     """
     config = QueryEnhancerConfig.from_settings(settings)
+    if llm_gateway is None:
+        if settings is None:
+            from app.core.config import get_settings
+
+            settings = get_settings()
+        fast_model = getattr(settings, "FAST_CHAT_MODEL", "") or None
+        gateway_timeout = max(
+            config.rewrite_timeout,
+            config.hyde_timeout,
+            config.decompose_timeout,
+        )
+        llm_gateway = LLMGateway(model=fast_model, timeout=gateway_timeout)
     return QueryEnhancer(
         llm_gateway=llm_gateway,
         embedding_service=embedding_service,

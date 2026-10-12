@@ -200,6 +200,58 @@ def _download_file_from_minio(storage_path: str) -> str:
     return tmp_path
 
 
+def _persist_parse_assets(document_id: str, assets) -> list[dict]:
+    """方案 D：把解析出的图片 asset 二进制持久化到 MinIO，返回可序列化元数据。
+
+    此前管线只透传 ``asset_count`` 数字，图片二进制在 Celery 任务边界被
+    丢弃，文档内嵌图片（图表/截图）对检索完全不可见。持久化后由
+    ``describe_images`` 任务下载并做视觉描述。单张失败仅记 WARNING。
+    """
+    image_assets = [
+        a for a in assets
+        if getattr(a, "type", "") == "image" and getattr(a, "data", None)
+    ]
+    if not image_assets:
+        return []
+
+    import io as _io
+
+    from app.core.config import get_settings
+    from app.core.minio import ensure_bucket_exists, get_minio_client
+
+    settings = get_settings()
+    client = get_minio_client()
+    ensure_bucket_exists()
+
+    metas: list[dict] = []
+    for asset in image_assets:
+        key = f"{document_id}/assets/{asset.id}"
+        try:
+            client.upload_fileobj(
+                Fileobj=_io.BytesIO(asset.data),
+                Bucket=settings.MINIO_BUCKET,
+                Key=key,
+                ExtraArgs={"ContentType": asset.mime_type or "image/png"},
+            )
+        except Exception as exc:  # noqa: BLE001 — 单张失败不阻塞管线
+            logger.warning(
+                "persist asset failed: doc=%s asset=%s error=%s",
+                document_id,
+                asset.id,
+                exc,
+            )
+            continue
+        metas.append({
+            "id": asset.id,
+            "type": asset.type,
+            "mime_type": asset.mime_type or "image/png",
+            "page_number": asset.page_number,
+            "storage_key": key,
+            "size": len(asset.data),
+        })
+    return metas
+
+
 def _task_decorator(**kwargs):
     """Decorator that wraps celery_app.task when available, or is a no-op."""
     if CELERY_AVAILABLE and celery_app is not None:
@@ -285,6 +337,10 @@ def parse_document(self, document_id: str) -> dict:
 
             _update_document_status(document_id, "parsing", 90)
 
+            # 方案 D：图片 asset 持久化到 MinIO 并随链透传元数据，
+            # 供 describe_images 任务做视觉识别。
+            assets_meta = _persist_parse_assets(document_id, parsed_doc.assets)
+
             # Serialize the result
             result = {
                 "document_id": document_id,
@@ -295,11 +351,15 @@ def parse_document(self, document_id: str) -> dict:
                         "bbox": block.bbox,
                         "page_number": block.page_number,
                         "style": block.style,
+                        # image block 的 asset_id 在 raw 里，必须随链透传，
+                        # 否则 describe_images 无法关联图片二进制。
+                        "raw": block.raw or {},
                     }
                     for block in parsed_doc.blocks
                 ],
                 "metadata": parsed_doc.metadata,
                 "asset_count": len(parsed_doc.assets),
+                "assets": assets_meta,
             }
 
             _update_document_status(document_id, "parsing", 100)
@@ -394,6 +454,7 @@ def profile_match(self, parse_result: dict) -> dict:
                 bbox=tuple(b["bbox"]) if b.get("bbox") else None,
                 page_number=b.get("page_number", 1),
                 style=b.get("style", {}),
+                raw=b.get("raw", {}),
             )
             for b in parse_result.get("blocks", [])
         ]
@@ -529,10 +590,41 @@ def universal_parser_check(self, match_result: dict) -> dict:
         )
         return match_result
 
+    # 方案 B（文字层闸门）：本地解析器抽出的文字量达标时，说明文档文字层
+    # 完好，逐页视觉解析是纯 token 浪费（每次几千 token、6-20s/页）。
+    # 只有文字稀疏（扫描件特征：无文字层）才真正进入视觉兜底。
+    from app.core.config import get_settings
+
+    min_chars_per_page = int(
+        getattr(get_settings(), "UNIVERSAL_PARSER_MIN_CHARS_PER_PAGE", 100)
+    )
+    blocks_for_gate = match_result.get("blocks", [])
+    total_chars = sum(len(b.get("text") or "") for b in blocks_for_gate)
+    page_numbers = {b.get("page_number", 1) for b in blocks_for_gate}
+    avg_chars_per_page = total_chars / max(len(page_numbers), 1)
+    if avg_chars_per_page >= min_chars_per_page:
+        logger.info(
+            "universal_parser skipped for %s: text layer sufficient "
+            "(avg_chars_per_page=%.0f threshold=%d reasons=%s)",
+            document_id,
+            avg_chars_per_page,
+            min_chars_per_page,
+            reasons,
+        )
+        return {
+            **match_result,
+            "universal_parser_triggered": False,
+            "universal_parser_trigger_reasons": list(reasons),
+            "universal_parser_skip_reason": "text_layer_sufficient",
+        }
+
     logger.info(
-        "universal_parser triggered for %s: reasons=%s",
+        "universal_parser triggered for %s: reasons=%s "
+        "avg_chars_per_page=%.0f threshold=%d",
         document_id,
         reasons,
+        avg_chars_per_page,
+        min_chars_per_page,
     )
 
     try:
@@ -545,6 +637,7 @@ def universal_parser_check(self, match_result: dict) -> dict:
                 bbox=tuple(b["bbox"]) if b.get("bbox") else None,
                 page_number=b.get("page_number", 1),
                 style=b.get("style", {}),
+                raw=b.get("raw", {}),
             )
             for b in match_result.get("blocks", [])
         ]
@@ -714,6 +807,7 @@ def process_document(self, match_result: dict) -> dict:
                 bbox=tuple(b["bbox"]) if b.get("bbox") else None,
                 page_number=b.get("page_number", 1),
                 style=b.get("style", {}),
+                raw=b.get("raw", {}),
             )
             for b in match_result.get("blocks", [])
         ]
@@ -803,6 +897,8 @@ def process_document(self, match_result: dict) -> dict:
             "profile_name": match_result.get("profile_name"),
             "quality_score": score_dict,
             "review_enqueued": review_enqueued,
+            # 方案 D：图片 asset 元数据透传给 describe_images 任务。
+            "assets": match_result.get("assets", []),
         }
 
         logger.info(
@@ -836,6 +932,267 @@ def process_document(self, match_result: dict) -> dict:
             raise
 
 
+def _intelligent_chunk_blocks(document_id: str, process_result: dict) -> list[dict] | None:
+    """用 IntelligentChunker 对清洗后的 blocks 做结构化分块。
+
+    返回 ``chunk_document`` 下游（embed/index）可直接消费的 chunk dict 列表。
+    任何异常都记 WARNING 并返回 ``None``，由调用方降级为旧的直通分块，
+    保证管线不因分块器问题中断。
+    """
+    try:
+        from app.services.chunker import ChunkingContext, IntelligentChunker
+        from app.services.document_processor import (
+            ProcessedBlock,
+            ProcessedDocument,
+        )
+
+        raw_blocks = process_result.get("blocks") or []
+        blocks: list[ProcessedBlock] = []
+        for b in raw_blocks:
+            text_value = (b.get("text") or "").strip()
+            if not text_value:
+                continue
+            style = b.get("style") or {}
+            blocks.append(
+                ProcessedBlock(
+                    type=b.get("type", "paragraph"),
+                    text=b.get("text") or "",
+                    heading_level=style.get("heading_level", 0) or 0,
+                    page_number=b.get("page_number", 1),
+                    asset_ids=list(b.get("asset_ids") or []),
+                )
+            )
+        if not blocks:
+            return []
+
+        profile = _resolve_profile_for_processing(
+            profile_id=process_result.get("profile_id"),
+            profile_name=process_result.get("profile_name"),
+        )
+
+        doc_info = _get_document_info(document_id) or {}
+        context = ChunkingContext(
+            source_file=os.path.basename(doc_info.get("storage_path", "")),
+            space_id=_get_document_space_id(document_id) or "",
+            permission_ids=[],
+            document_id=document_id,
+        )
+
+        processed_doc = ProcessedDocument(
+            blocks=blocks,
+            metadata=dict(process_result.get("metadata") or {}),
+        )
+        structured = IntelligentChunker().chunk(processed_doc, profile, context)
+        if not structured:
+            return []
+
+        chunks: list[dict] = []
+        for c in structured:
+            chunks.append(
+                {
+                    "id": c.id,
+                    "chunk_index": c.chunk_index,
+                    "text": c.text,
+                    "type": "paragraph",
+                    "page_number": c.page_number,
+                    "style": (
+                        {"heading_level": c.heading_level} if c.heading_level else {}
+                    ),
+                    "token_count": c.token_count,
+                    "title_chain": c.title_chain,
+                    "parent_id": c.parent_id,
+                    "depth": c.depth,
+                    "space_id": c.space_id,
+                    "source_file": c.source_file,
+                    "permission_ids": list(c.permission_ids),
+                    "asset_ids": list(c.asset_ids),
+                }
+            )
+        return chunks
+    except Exception as exc:  # noqa: BLE001 — 结构化分块失败不应中断管线
+        logger.warning(
+            "intelligent chunking failed for %s: %s; "
+            "falling back to pass-through chunking",
+            document_id,
+            exc,
+        )
+        return None
+
+
+_PIPELINE_IMAGE_PROMPT = (
+    "这是文档中的一张插图（可能是数据图表、流程图、界面截图或照片）。"
+    "请客观描述图片内容：图表类型、坐标轴/图例、关键数据与趋势、"
+    "可见的文字要点。只陈述能看到的内容，不要推测，200 字以内。"
+)
+
+# 与 daily_material_tasks 一致：worker 子进程内复用持久事件循环，
+# 避免「每任务新建 loop 用完即关」导致全局客户端报 Event loop is closed。
+_PIPELINE_DESCRIBE_LOOP = None
+
+
+def _run_describe_async(coro):
+    """在 worker 子进程的持久事件循环上运行图片识别协程。"""
+    import asyncio
+
+    global _PIPELINE_DESCRIBE_LOOP
+    if _PIPELINE_DESCRIBE_LOOP is None or _PIPELINE_DESCRIBE_LOOP.is_closed():
+        _PIPELINE_DESCRIBE_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_PIPELINE_DESCRIBE_LOOP)
+    return _PIPELINE_DESCRIBE_LOOP.run_until_complete(coro)
+
+
+@_task_decorator(
+    bind=True,
+    name="pipeline.describe_images",
+    max_retries=1,
+    default_retry_delay=10,
+    soft_time_limit=580,
+    time_limit=600,
+)
+def describe_images(self, process_result: dict) -> dict:
+    """方案 D：为文档内嵌图片生成视觉描述，写回 image block 文本。
+
+    位于 ``process_document`` 与 ``chunk_document`` 之间：
+    - parse 阶段图片 asset 已持久化到 MinIO（``assets`` 元数据随链透传）；
+    - 本任务逐张下载并调视觉模型（REPORT_MODEL）生成客观描述，
+      替换 image block 的占位文本（如 ``[Image: xxx]``）；
+    - 单文档描述张数受 ``PIPELINE_IMAGE_DESCRIBE_MAX`` 限制，
+      小于 ``PIPELINE_IMAGE_DESCRIBE_MIN_BYTES`` 的图标/装饰图跳过；
+    - 识别并发执行（4 路），20 张约 100s；单张失败保留占位文本。
+
+    描述写回后，图片信息随正文一起进入 chunk，检索/问答即可命中
+    文档内嵌图表的内容。
+    """
+    document_id = process_result["document_id"]
+    logger.info("Starting describe_images for %s", document_id)
+    start_time = time.perf_counter()
+
+    try:
+        blocks = process_result.get("blocks", [])
+        assets_meta = {a["id"]: a for a in process_result.get("assets", [])}
+        image_blocks = [
+            b for b in blocks
+            if b.get("type") == "image" and b.get("asset_ids")
+        ]
+        if not image_blocks:
+            logger.info(
+                "describe_images skipped for %s: no image blocks elapsed_ms=%d",
+                document_id,
+                int((time.perf_counter() - start_time) * 1000),
+            )
+            return process_result
+
+        from app.core.config import get_settings
+        from app.core.minio import get_minio_client
+
+        settings = get_settings()
+        max_describe = int(getattr(settings, "PIPELINE_IMAGE_DESCRIBE_MAX", 20))
+        min_bytes = int(
+            getattr(settings, "PIPELINE_IMAGE_DESCRIBE_MIN_BYTES", 8192)
+        )
+        client = get_minio_client()
+
+        # 筛出可识别的 (block, meta, 图片字节) 候选，下载一次性完成。
+        candidates: list[tuple[dict, dict, bytes]] = []
+        for block in image_blocks:
+            if len(candidates) >= max_describe:
+                break
+            asset_id = (block.get("asset_ids") or [""])[0]
+            meta = assets_meta.get(asset_id)
+            if not meta or meta.get("size", 0) < min_bytes:
+                continue
+            try:
+                import io as _io
+
+                buf = _io.BytesIO()
+                client.download_fileobj(
+                    Bucket=settings.MINIO_BUCKET,
+                    Key=meta["storage_key"],
+                    Fileobj=buf,
+                )
+                candidates.append((block, meta, buf.getvalue()))
+            except Exception as exc:  # noqa: BLE001 — 单张下载失败跳过
+                logger.warning(
+                    "describe image download failed: doc=%s asset=%s error=%s",
+                    document_id,
+                    asset_id,
+                    exc,
+                )
+
+        if not candidates:
+            logger.info(
+                "describe_images skipped for %s: no eligible images elapsed_ms=%d",
+                document_id,
+                int((time.perf_counter() - start_time) * 1000),
+            )
+            return process_result
+
+        async def _describe_all() -> list[str]:
+            """并发识别全部候选图片（4 路信号量限流，单张失败返回空串）。"""
+            import asyncio as _aio
+
+            from app.services.llm_gateway import LLMGateway
+
+            sem = _aio.Semaphore(4)
+
+            async def _one(meta: dict, data: bytes) -> str:
+                async with sem:
+                    try:
+                        gateway = LLMGateway(
+                            model=settings.REPORT_MODEL or None, timeout=120.0
+                        )
+                        resp = await gateway.complete_multimodal(
+                            prompt=_PIPELINE_IMAGE_PROMPT,
+                            images=[data],
+                            image_mime_type=meta.get("mime_type") or "image/png",
+                            max_tokens=1024,
+                        )
+                        return (resp.content or "").strip()
+                    except Exception as exc:  # noqa: BLE001 — 单张失败保留占位
+                        logger.warning(
+                            "describe image failed: doc=%s asset=%s error=%s",
+                            document_id,
+                            meta.get("id"),
+                            exc,
+                        )
+                        return ""
+
+            return await _aio.gather(
+                *[_one(meta, data) for _, meta, data in candidates]
+            )
+
+        descriptions = _run_describe_async(_describe_all())
+
+        described = 0
+        for (block, _meta, _data), description in zip(candidates, descriptions):
+            if description:
+                block["text"] = f"【插图内容识别】{description}"
+                described += 1
+
+        if described:
+            process_result.setdefault("metadata", {})[
+                "images_described"
+            ] = described
+        logger.info(
+            "describe_images done: document_id=%s described=%d total_image_blocks=%d "
+            "elapsed_ms=%d",
+            document_id,
+            described,
+            len(image_blocks),
+            int((time.perf_counter() - start_time) * 1000),
+        )
+        return process_result
+
+    except SoftTimeLimitExceeded:
+        logger.error("describe_images timeout for %s", document_id)
+        # 超时不再重试：图片识别是增强项，直接放行原 blocks 进分块。
+        return process_result
+
+    except Exception as e:  # noqa: BLE001 — 增强步骤不应中断管线
+        logger.error("describe_images failed for %s: %s", document_id, e)
+        return process_result
+
+
 @_task_decorator(
     bind=True,
     name="pipeline.chunk_document",
@@ -861,16 +1218,24 @@ def chunk_document(self, process_result: dict) -> dict:
     try:
         # 当前管线的 chunk 输入只需要文本块摘要，不把正文写入日志，避免泄露内容。
         blocks = process_result["blocks"]
-        chunks = []
-        for i, block in enumerate(blocks):
-            if block["text"].strip():
-                chunks.append({
-                    "chunk_index": i,
-                    "text": block["text"],
-                    "type": block["type"],
-                    "page_number": block.get("page_number", 1),
-                    "style": block.get("style", {}),
-                })
+
+        # 优先走 IntelligentChunker 结构化分块（标题层级归并 + token 合并 +
+        # overlap + title_chain 元数据）。此前管线是「一个 block 一个 chunk」
+        # 的直通实现，会把标题/正文切成碎片，导致检索只命中无正文内容的
+        # 标题 chunk；IntelligentChunker 才是设计上的正式分块器。失败时降级
+        # 回旧的直通逻辑，保证管线不中断。
+        chunks = _intelligent_chunk_blocks(document_id, process_result)
+        if chunks is None:
+            chunks = []
+            for i, block in enumerate(blocks):
+                if block["text"].strip():
+                    chunks.append({
+                        "chunk_index": i,
+                        "text": block["text"],
+                        "type": block["type"],
+                        "page_number": block.get("page_number", 1),
+                        "style": block.get("style", {}),
+                    })
 
         _update_document_status(document_id, "chunking", 100)
 
@@ -1196,7 +1561,8 @@ def submit_pipeline(document_id: str) -> None:
     """Submit a document to the processing pipeline.
 
     Creates and dispatches the full Celery task chain:
-    parse → profile_match → process → chunk → embed → index
+    parse → profile_match → universal_parser_check → process →
+    describe_images → chunk → embed → index
 
     Args:
         document_id: UUID of the document to process
@@ -1212,6 +1578,7 @@ def submit_pipeline(document_id: str) -> None:
         profile_match.s(),
         universal_parser_check.s(),
         process_document.s(),
+        describe_images.s(),
         chunk_document.s(),
         embed_chunks.s(),
         index_chunks.s(),

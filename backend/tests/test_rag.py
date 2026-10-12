@@ -97,13 +97,32 @@ def mock_llm_gateway():
 
 
 @pytest.fixture
-def rag_engine(mock_search_service, mock_llm_gateway, mock_redis):
+def mock_query_enhancer():
+    """QueryEnhancer mock：直接返回原查询，不触发真实 LLM 调用。"""
+    from app.services.query_enhancer import EnhancedQuery
+
+    enhancer = AsyncMock()
+
+    async def _enhance(query: str) -> EnhancedQuery:
+        return EnhancedQuery(original=query, all_text_queries=[query])
+
+    enhancer.enhance = _enhance
+    return enhancer
+
+
+@pytest.fixture
+def rag_engine(mock_search_service, mock_llm_gateway, mock_redis, mock_query_enhancer):
     """Create a RAGEngine with all dependencies mocked."""
-    return RAGEngine(
+    engine = RAGEngine(
         search_service=mock_search_service,
         llm_gateway=mock_llm_gateway,
         redis_client=mock_redis,
+        query_enhancer=mock_query_enhancer,
     )
+    # 持久化层走真实 PG，测试中打桩掉，避免依赖数据库
+    engine._persist_turn_db = AsyncMock()
+    engine._load_history_from_db = AsyncMock(return_value=[])
+    return engine
 
 
 def make_search_result(
@@ -353,15 +372,19 @@ class TestSimilarityThreshold:
     """Tests for similarity threshold filtering."""
 
     @pytest.mark.asyncio
-    async def test_all_below_threshold_returns_no_info(self, rag_engine, mock_search_service):
-        """When all results are below threshold, should return '未找到相关信息'."""
-        # All results have score < 0.5
+    async def test_all_below_threshold_falls_back_to_general_mode(self, rag_engine, mock_search_service, mock_llm_gateway):
+        """全部结果低于阈值时不再硬拒，转为通用问答模式（LLM 仍被调用）。"""
         low_score_results = [
             make_search_result(score=0.3),
             make_search_result(score=0.2),
             make_search_result(score=0.4),
         ]
         mock_search_service.search.return_value = make_search_response(low_score_results)
+
+        async def mock_stream(*args, **kwargs):
+            yield "general answer"
+
+        mock_llm_gateway.stream = mock_stream
 
         config = RAGConfig(similarity_threshold=0.5)
         result = await collect_stream(
@@ -374,7 +397,7 @@ class TestSimilarityThreshold:
             )
         )
 
-        assert result == NO_RELEVANT_INFO_MESSAGE
+        assert result == "general answer"
 
     @pytest.mark.asyncio
     async def test_some_above_threshold_proceeds(self, rag_engine, mock_search_service, mock_llm_gateway):
@@ -408,10 +431,15 @@ class TestSimilarityThreshold:
         assert result != NO_RELEVANT_INFO_MESSAGE
 
     @pytest.mark.asyncio
-    async def test_custom_threshold(self, rag_engine, mock_search_service):
-        """Custom threshold should be respected."""
+    async def test_custom_threshold(self, rag_engine, mock_search_service, mock_llm_gateway):
+        """Custom threshold should be respected (低于阈值时转通用模式，LLM 仍被调用)."""
         results = [make_search_result(score=0.6)]
         mock_search_service.search.return_value = make_search_response(results)
+
+        async def mock_stream(*args, **kwargs):
+            yield "fallback answer"
+
+        mock_llm_gateway.stream = mock_stream
 
         # With threshold 0.7, score 0.6 should be filtered out
         config = RAGConfig(similarity_threshold=0.7)
@@ -425,7 +453,7 @@ class TestSimilarityThreshold:
             )
         )
 
-        assert result == NO_RELEVANT_INFO_MESSAGE
+        assert result == "fallback answer"
 
 
 # ─── LLM Timeout Tests ────────────────────────────────────────────────
@@ -532,48 +560,6 @@ class TestSessionManagement:
         # Should have the most recent messages
         assert "Question 24" in history[-2]["content"]
         assert "Answer 24" in history[-1]["content"]
-
-    @pytest.mark.asyncio
-    async def test_session_expiration(self, rag_engine, mock_redis):
-        """Session should be marked expired after 30 min inactivity."""
-        session_id = "expired_session"
-        key = f"{SESSION_KEY_PREFIX}{session_id}"
-
-        # Set last_active to 31 minutes ago
-        expired_time = str(time.time() - (SESSION_TTL_SECONDS + 60))
-        mock_redis._store[key] = {
-            "user_id": "user_1",
-            "messages": "[]",
-            "last_active": expired_time,
-            "session_id": session_id,
-        }
-
-        is_expired = await rag_engine._is_session_expired(session_id)
-        assert is_expired is True
-
-    @pytest.mark.asyncio
-    async def test_session_not_expired(self, rag_engine, mock_redis):
-        """Session should not be expired within 30 min."""
-        session_id = "active_session"
-        key = f"{SESSION_KEY_PREFIX}{session_id}"
-
-        # Set last_active to 5 minutes ago
-        recent_time = str(time.time() - 300)
-        mock_redis._store[key] = {
-            "user_id": "user_1",
-            "messages": "[]",
-            "last_active": recent_time,
-            "session_id": session_id,
-        }
-
-        is_expired = await rag_engine._is_session_expired(session_id)
-        assert is_expired is False
-
-    @pytest.mark.asyncio
-    async def test_new_session_not_expired(self, rag_engine, mock_redis):
-        """A non-existent session should not be considered expired."""
-        is_expired = await rag_engine._is_session_expired("new_session")
-        assert is_expired is False
 
     @pytest.mark.asyncio
     async def test_get_session(self, rag_engine, mock_redis):

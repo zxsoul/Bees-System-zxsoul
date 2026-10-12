@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     CHAT_API_KEY: str = ""
     CHAT_MODEL: str = "gpt-4o"
 
+    # 分层模型：轻量任务（查询改写 / 语境化 / HyDE / 子查询分解）使用的
+    # 快速模型。思考型主模型（如 kimi-k2.6）在这类短输出任务上既慢又贵，
+    # 建议配置为非思考的快模型（如 kimi-k2 / qwen-turbo）。
+    # 留空时回落到 ``CHAT_MODEL``，行为与单一模型部署完全一致。
+    FAST_CHAT_MODEL: str = ""
+
+    # 日报生成与截图识别专用模型。日报是大段正式写作、截图识别需要
+    # 视觉能力，适合用高质量通用模型（如 kimi-k2.6）；聊天主回答可
+    # 用快速模型（CHAT_MODEL）。留空时回落到 ``CHAT_MODEL``。
+    REPORT_MODEL: str = ""
+
     # LLM 调用超时（任务 16.7 / 需求 8.7）
     # ``LLMGateway`` 在构造时未显式传入 ``timeout`` 时使用此值。LLM 调用
     # 超过该时长后，``LLMGateway`` 抛出 ``LLMGatewayError(reason="timeout")``，
@@ -182,6 +193,23 @@ class Settings(BaseSettings):
     # 仅按字符数切分原始文本以保证文档至少可被检索。最小值 1（构造函数会兜底）。
     UNIVERSAL_PARSER_FALLBACK_CHUNK_CHARS: int = 500
 
+    # 方案 B（文字层闸门）：本地解析器抽出的平均每页字符数 ≥ 该阈值时，
+    # 认为文档文字层完好，跳过逐页视觉兜底（token 黑洞闸门）。
+    # 扫描件特征是无文字层（远低于阈值），仍会正常触发视觉解析。
+    UNIVERSAL_PARSER_MIN_CHARS_PER_PAGE: int = 100
+
+    # 方案 C（混合解析）：视觉兜底运行期间，单页原始文本 ≥ 该阈值时
+    # 跳过该页的视觉调用，直接以原文作为该页内容。
+    UNIVERSAL_PARSER_TEXT_PAGE_MIN_CHARS: int = 200
+    # 方案 C：单文档视觉解析页数上限，超出后剩余页走原文/降级路径，限制成本。
+    UNIVERSAL_PARSER_MAX_VISION_PAGES: int = 50
+
+    # 方案 D（内嵌图片理解）：管线内单文档最多做视觉描述的图片张数，
+    # 防止图集类文档成本失控；每张约 1 次视觉调用。
+    PIPELINE_IMAGE_DESCRIBE_MAX: int = 20
+    # 方案 D：小于该字节数的图片不做视觉描述（图标/装饰性小图没有信息价值）。
+    PIPELINE_IMAGE_DESCRIBE_MIN_BYTES: int = 8192
+
     # 任务 15.6 / 需求 7：查询增强子模块的全局开关。三者均默认 True，
     # 可按功能独立启用 / 禁用：
     # - ``QUERY_ENHANCEMENT_ENABLE_REWRITE``: LLM 生成 ≤5 个语义改写变体
@@ -192,6 +220,14 @@ class Settings(BaseSettings):
     QUERY_ENHANCEMENT_ENABLE_REWRITE: bool = True
     QUERY_ENHANCEMENT_ENABLE_HYDE: bool = True
     QUERY_ENHANCEMENT_ENABLE_DECOMPOSITION: bool = True
+
+    # 查询增强各子模块超时（秒）。原设计硬编码 2s/3s/5s，对思考型模型
+    # （如 kimi-k2.6，一次完整生成约 10-12s）过于苛刻，实测全部超时降级；
+    # 按真实延迟调大并允许用环境变量按部署环境覆盖。
+    QUERY_ENHANCEMENT_REWRITE_TIMEOUT: float = 15.0
+    QUERY_ENHANCEMENT_HYDE_TIMEOUT: float = 30.0
+    QUERY_ENHANCEMENT_DECOMPOSE_TIMEOUT: float = 15.0
+    QUERY_ENHANCEMENT_OVERALL_TIMEOUT: float = 35.0
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

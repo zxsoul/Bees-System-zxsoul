@@ -349,9 +349,12 @@ class DailyReportService:
                     text = "（截图数量超出单次合成上限，未识别内容）"
                 else:
                     image_count += 1
-                    text = await self._describe_image(m)
+                    text = await self._resolve_image_description(m)
             else:
-                text = "（暂不支持解析该文件类型，仅记录文件名）"
+                # other（PDF/DOCX 等）：优先用上传后异步提取的文本缓存
+                text = (m.get("extracted_text") or "").strip()
+                if not text:
+                    text = "（暂不支持解析该文件类型，仅记录文件名）"
 
             if not text.strip():
                 continue
@@ -367,11 +370,41 @@ class DailyReportService:
             )
         return "\n\n".join(sections)
 
+    async def _resolve_image_description(self, material: dict) -> str:
+        """取截图的识别描述：优先用上传后异步识别的缓存结果。
+
+        上传即预处理（``daily_materials.analyze`` 任务）通常已完成；
+        刚上传就点生成时，对 pending/processing 状态短暂轮询等待
+        （每 2s、最多 30s）；超时或识别失败则回退到同步识别兜底。
+        """
+        if material.get("ai_description"):
+            return material["ai_description"]
+
+        if material.get("desc_status") in ("pending", "processing"):
+            service = DailyMaterialService()
+            for _ in range(15):
+                await asyncio.sleep(2)
+                refreshed = await service.get_material(material["id"])
+                if not refreshed:
+                    break
+                if refreshed.get("ai_description"):
+                    return refreshed["ai_description"]
+                if refreshed.get("desc_status") not in ("pending", "processing"):
+                    break
+                material = refreshed
+
+        # 兜底：异步结果不可用，退回同步识别（保持既有降级语义）
+        return await self._describe_image(material)
+
     async def _describe_image(self, material: dict) -> str:
         """多模态识别截图内容；任何失败都降级为占位说明。"""
+        from app.core.config import get_settings
+
         data = DailyMaterialService.material_bytes(material)
         mime = material.get("content_type") or "image/png"
-        gateway = LLMGateway(timeout=120)
+        # 截图识别需要视觉能力 + 准确读数，固定走 REPORT_MODEL（如 kimi-k2.6）
+        report_model = get_settings().REPORT_MODEL or None
+        gateway = LLMGateway(model=report_model, timeout=120)
         try:
             resp = await asyncio.wait_for(
                 gateway.complete_multimodal(
@@ -517,8 +550,12 @@ class DailyReportService:
         system_prompt = REPORT_SYSTEM_PROMPT.format(
             author=author, date=report_date.isoformat()
         )
-        # 思考型模型长输入下推理耗时可能超过默认 60s 超时，显式放宽
-        gateway = LLMGateway(timeout=180)
+        # 日报是大段正式写作，固定走 REPORT_MODEL（如 kimi-k2.6）；
+        # 长输入下生成耗时可能超过默认 60s 超时，显式放宽
+        from app.core.config import get_settings
+
+        report_model = get_settings().REPORT_MODEL or None
+        gateway = LLMGateway(model=report_model, timeout=180)
         prompt = (
             f"以下是 {author} 在 {report_date.isoformat()} 上传的"
             f"工作材料，请合成当日工作日报：\n\n{materials}"

@@ -57,6 +57,16 @@ export default function DocumentDetailPage() {
   const highlightIndex =
     highlightParam !== null ? Number(highlightParam) : null;
 
+  // 来源页（引用跳转时由来源方写入，如 /chat?session=xxx）。
+  // 校验必须是以 / 开头的站内路径，防止开放重定向。
+  const fromParam = searchParams.get("from");
+  const fromInternal =
+    fromParam && fromParam.startsWith("/") && !fromParam.startsWith("//")
+      ? fromParam
+      : null;
+  const backHref = fromInternal ?? "/documents";
+  const backLabel = fromInternal ? "返回" : "返回文档列表";
+
   const [detail, setDetail] = React.useState<DocumentDetail | null>(null);
   const [chunks, setChunks] = React.useState<DocumentChunk[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -112,10 +122,10 @@ export default function DocumentDetailPage() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => (window.location.href = "/documents")}
+          onClick={() => (window.location.href = backHref)}
         >
           <ArrowLeft className="mr-1 h-4 w-4" />
-          返回文档列表
+          {backLabel}
         </Button>
         {detail && (
           <div className="flex min-w-0 flex-1 items-center gap-3">

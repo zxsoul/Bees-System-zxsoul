@@ -368,6 +368,11 @@ class LLMGateway:
                 reason=reason,
             )
 
+    # 模型级参数黑名单缓存：某些模型（如 kimi-k2.6）只接受 temperature=1，
+    # 首次 400 降级重试后记录到该集合，后续调用直接不传，避免每次请求
+    # 都白白多一次失败往返。
+    _TEMPERATURE_UNSUPPORTED_MODELS: set[str] = set()
+
     def _build_kwargs(
         self,
         messages: list[dict],
@@ -376,13 +381,16 @@ class LLMGateway:
         model: str,
     ) -> dict:
         """Assemble Chat Completions request parameters."""
-        return {
+        kwargs = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "timeout": self.timeout,
         }
+        if model in LLMGateway._TEMPERATURE_UNSUPPORTED_MODELS:
+            kwargs.pop("temperature")
+        return kwargs
 
     async def _create_with_param_fallback(self, client, kwargs: dict):
         """Call ``chat.completions.create`` with unsupported-parameter fallback.
@@ -420,6 +428,10 @@ class LLMGateway:
                         exc,
                     )
                     attempt_kwargs.pop("temperature")
+                    # 记住该模型不接受自定义 temperature，后续请求不再尝试
+                    rejected_model = attempt_kwargs.get("model")
+                    if isinstance(rejected_model, str) and rejected_model:
+                        LLMGateway._TEMPERATURE_UNSUPPORTED_MODELS.add(rejected_model)
                     continue
                 raise
 

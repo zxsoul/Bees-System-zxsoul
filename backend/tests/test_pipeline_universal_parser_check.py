@@ -188,9 +188,9 @@ class TestSubmitPipelineChainOrder:
         with patch.object(pipeline_module, "chain", new=fake_chain):
             pipeline_module.submit_pipeline("00000000-0000-0000-0000-00000000abcd")
 
-        # 期望 7 个 .s 签名：parse → profile_match → universal_parser_check
-        # → process → chunk → embed → index。
-        assert len(recorded_args) == 7
+        # 期望 8 个 .s 签名：parse → profile_match → universal_parser_check
+        # → process → describe_images → chunk → embed → index。
+        assert len(recorded_args) == 8
 
         # 每个签名都来自对应 task 的 ``.s``；celery Signature 对象自带 ``task`` 属性。
         task_names = []
@@ -202,7 +202,10 @@ class TestSubmitPipelineChainOrder:
         # process_document 之前。
         assert "pipeline.universal_parser_check" in task_names
         assert task_names.index("pipeline.universal_parser_check") == 2
-        # 顺序整体校验：profile_match (1) → universal_parser_check (2) → process_document (3)
+        # 顺序整体校验：profile_match (1) → universal_parser_check (2)
+        # → process_document (3) → describe_images (4) → chunk_document (5)
         assert task_names[1] == "pipeline.profile_match"
         assert task_names[2] == "pipeline.universal_parser_check"
         assert task_names[3] == "pipeline.process_document"
+        assert task_names[4] == "pipeline.describe_images"
+        assert task_names[5] == "pipeline.chunk_document"

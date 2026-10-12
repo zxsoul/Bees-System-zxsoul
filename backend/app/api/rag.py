@@ -244,8 +244,9 @@ async def chat(
 
     - Retrieves top-K chunks (default 5, configurable 1-20)
     - Filters by similarity threshold (default 0.5)
-    - Maintains conversation history (last 20 turns, 30 min TTL)
-    - Returns "未找到相关信息" if no relevant chunks found
+    - Query enhancement (rewrite / HyDE / sub-queries) wired into retrieval
+    - Maintains conversation history (last 20 turns, sliding 7-day TTL)
+    - Falls back to general-knowledge answer when no relevant chunks found
     - Returns error message on LLM timeout (default 60s)
     """
     # Get user's accessible spaces

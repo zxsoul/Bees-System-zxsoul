@@ -238,6 +238,7 @@ class SearchResult:
     score: float  # 0.0 - 1.0
     highlight: str  # 最多 200 字符
     page_number: int = 0
+    content: str = ""  # chunk 完整正文（供 RAG 问答使用，前端展示仍用 highlight）
 
 
 @dataclass
@@ -274,6 +275,8 @@ class SearchService:
         allowed_space_ids: list[str],
         page: int = 1,
         page_size: int = DEFAULT_PAGE_SIZE,
+        extra_queries: list[str] | None = None,
+        extra_dense_vectors: list[list[float]] | None = None,
     ) -> SearchResponse:
         """Execute composite search with multi-recall, RRF fusion, and reranking.
 
@@ -283,6 +286,11 @@ class SearchService:
             allowed_space_ids: List of space IDs the user has access to
             page: Page number (1-based)
             page_size: Number of results per page (max 50)
+            extra_queries: 查询增强产出的补充文本查询（改写变体 + 子查询，
+                由 ``QueryEnhancer`` 生成）。每条额外查询独立执行三路召回，
+                结果与主查询召回一起进入 RRF 融合（任务 15.x 设计接线）。
+            extra_dense_vectors: HyDE 假设文档的 dense 向量，逐条执行
+                dense 召回后并入 RRF 融合。
 
         Returns:
             SearchResponse with paginated, ranked results
@@ -332,6 +340,17 @@ class SearchService:
             qdrant_filter=qdrant_filter,
             opensearch_filter=opensearch_filter,
         )
+
+        # 查询增强补充召回：改写变体 / 子查询各跑三路召回，HyDE 向量跑 dense
+        # 召回；全部结果列表并入 RRF 融合，提升召回率（任务 15.x 设计接线）。
+        extra_recalls = await self._enhanced_recall(
+            extra_queries=extra_queries or [],
+            extra_dense_vectors=extra_dense_vectors or [],
+            qdrant_filter=qdrant_filter,
+            opensearch_filter=opensearch_filter,
+        )
+        if extra_recalls:
+            recall_results.extend(extra_recalls)
 
         # RRF Fusion
         candidates = self._rrf_fusion(recall_results)
@@ -476,6 +495,83 @@ class SearchService:
             results.append(result)
 
         return results
+
+    # ─── Query-Enhancement Supplementary Recall ────────────────────────
+
+    # 补充召回的规模上限：改写变体 ≤5 + 子查询 ≤5，文本查询合计最多 8 条；
+    # HyDE 向量最多 3 条（与 QueryEnhancer 的 MAX_HYDE_DOCUMENTS 对齐）。
+    _MAX_EXTRA_QUERIES = 8
+    _MAX_EXTRA_DENSE = 3
+
+    async def _enhanced_recall(
+        self,
+        extra_queries: list[str],
+        extra_dense_vectors: list[list[float]],
+        qdrant_filter: dict,
+        opensearch_filter: dict,
+    ) -> list[list[SearchHit]]:
+        """对查询增强产物执行补充召回（改写变体 / 子查询 / HyDE 向量）。
+
+        每条额外文本查询独立执行完整三路召回（BM25 + Dense + Sparse），
+        每条 HyDE 向量执行 dense 召回；全部并行、各自受单路超时约束，
+        任何一路失败静默跳过，不影响主查询结果。
+
+        Returns:
+            额外召回结果列表的集合（元素为每个 retriever 的命中列表），
+            直接并入主流程的 RRF 融合输入。
+        """
+        queries = [q.strip() for q in extra_queries if q and q.strip()][
+            : self._MAX_EXTRA_QUERIES
+        ]
+        vectors = [v for v in extra_dense_vectors if v][: self._MAX_EXTRA_DENSE]
+        if not queries and not vectors:
+            return []
+
+        async def _recall_one_query(q: str) -> list[list[SearchHit]]:
+            embedding = await self._embedding_service.embed_query(q)
+            return await self._multi_recall(
+                query=q,
+                dense_vector=embedding.dense_vector,
+                sparse_indices=embedding.sparse_indices,
+                sparse_values=embedding.sparse_values,
+                qdrant_filter=qdrant_filter,
+                opensearch_filter=opensearch_filter,
+            )
+
+        async def _recall_one_vector(vec: list[float]) -> list[SearchHit]:
+            return await self._dense_recall(vec, qdrant_filter)
+
+        tasks = [_recall_one_query(q) for q in queries] + [
+            _recall_one_vector(v) for v in vectors
+        ]
+        gathered = await asyncio.gather(
+            *[asyncio.wait_for(t, timeout=RETRIEVER_TIMEOUT + 1.0) for t in tasks],
+            return_exceptions=True,
+        )
+
+        extra: list[list[SearchHit]] = []
+        for result in gathered:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "search enhanced recall failed or timed out: %s", result
+                )
+                continue
+            if not result:
+                continue
+            # _recall_one_query 返回 list[list[SearchHit]]（三路召回），
+            # _recall_one_vector 返回 list[SearchHit]（单路），统一扁平化。
+            if isinstance(result[0], SearchHit):
+                extra.append(result)
+            else:
+                extra.extend(result)
+
+        logger.info(
+            "search enhanced recall completed: extra_queries=%d hyde_vectors=%d recall_lists=%d",
+            len(queries),
+            len(vectors),
+            len(extra),
+        )
+        return extra
 
     # ─── BM25 Retriever (OpenSearch) ───────────────────────────────────
 
@@ -951,6 +1047,7 @@ class SearchService:
                     page_number=hit.page_number,
                     score=self._clamp_score(hit.score),
                     highlight=highlight,
+                    content=hit.content,
                 )
             )
         return results

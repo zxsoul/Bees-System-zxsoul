@@ -39,6 +39,16 @@ export default function ChatPage() {
     loadSessions();
   }, [loadSessions]);
 
+  // 从文档详情页「返回」时 URL 带 ?session=<id>，自动恢复该会话，
+  // 让用户回到引用跳转前的对话现场。仅挂载时执行一次。
+  React.useEffect(() => {
+    const target = new URLSearchParams(window.location.search).get("session");
+    if (target && target !== currentSessionId) {
+      void handleSelectSession(target);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleSelectSession = async (sessionId: string) => {
     if (sessionId === currentSessionId) return;
 

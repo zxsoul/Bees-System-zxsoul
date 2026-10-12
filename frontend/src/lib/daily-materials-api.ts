@@ -23,6 +23,12 @@ export interface DailyMaterial {
   size: number;
   kind: "text" | "image" | "other";
   uploaded_at: string;
+  /** 异步识别状态：text 类上传即 done */
+  desc_status: "pending" | "processing" | "done" | "failed";
+  /** 图片的 AI 识别描述（done 后有值） */
+  ai_description: string | null;
+  /** 文档类提取的文本（done 后有值） */
+  extracted_text: string | null;
 }
 
 export interface DailyMaterialDetail extends DailyMaterial {

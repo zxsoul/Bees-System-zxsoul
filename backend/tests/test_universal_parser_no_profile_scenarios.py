@@ -71,6 +71,10 @@ def _make_parser(*, llm_gateway=None) -> UniversalParser:
             UNIVERSAL_PARSER_LIBREOFFICE_TIMEOUT=60,
             UNIVERSAL_PARSER_MAX_RAW_TEXT_CHARS=3000,
             UNIVERSAL_PARSER_FALLBACK_CHUNK_CHARS=500,
+            # 这些用例聚焦 LLM 逐页行为，关闭方案 C 的文字页闸门与
+            # 视觉页数上限，保证每页都走 LLM 路径。
+            UNIVERSAL_PARSER_TEXT_PAGE_MIN_CHARS=10**9,
+            UNIVERSAL_PARSER_MAX_VISION_PAGES=10**9,
             UNIVERSAL_PARSER_VISION_MODEL="",
             UNIVERSAL_PARSER_TEXT_MODEL="",
         )

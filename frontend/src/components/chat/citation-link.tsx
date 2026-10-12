@@ -1,7 +1,7 @@
 "use client";
 
 import { FileText } from "lucide-react";
-import { type Citation } from "@/stores/chat-store";
+import { type Citation, useChatStore } from "@/stores/chat-store";
 
 interface CitationLinkProps {
   citation: Citation;
@@ -9,11 +9,19 @@ interface CitationLinkProps {
 }
 
 export function CitationLink({ citation, index }: CitationLinkProps) {
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
+
   const handleClick = () => {
     // Navigate to document with highlight parameter
     const params = new URLSearchParams({
       highlight: String(citation.chunk_index),
     });
+    // 记录来源页面（含当前会话 ID），文档详情页的「返回」按钮据此
+    // 回到原对话而不是固定落到文档列表。
+    params.set(
+      "from",
+      currentSessionId ? `/chat?session=${currentSessionId}` : "/chat"
+    );
     window.location.href = `/documents/${citation.document_id}?${params.toString()}`;
   };
 

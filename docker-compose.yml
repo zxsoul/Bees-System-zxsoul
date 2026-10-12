@@ -145,6 +145,10 @@ services:
       - CHAT_API_BASE=${CHAT_API_BASE:-${CPA_API_BASE:-https://api.openai.com/v1}}
       - CHAT_API_KEY=${CHAT_API_KEY:-${CPA_API_KEY:-}}
       - CHAT_MODEL=${CHAT_MODEL:-gpt-5.5}
+      # 轻量任务（查询改写/语境化/HyDE/子查询）快速模型，留空回落 CHAT_MODEL
+      - FAST_CHAT_MODEL=${FAST_CHAT_MODEL:-}
+      # 日报生成与截图识别专用模型，留空回落 CHAT_MODEL
+      - REPORT_MODEL=${REPORT_MODEL:-}
       # Embedding 直连（默认取阿里百炼配置）
       - EMBEDDING_API_BASE=${EMBEDDING_API_BASE:-${DASHSCOPE_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-${DASHSCOPE_API_KEY:-}}
@@ -225,6 +229,10 @@ services:
       - CHAT_API_BASE=${CHAT_API_BASE:-${CPA_API_BASE:-https://api.openai.com/v1}}
       - CHAT_API_KEY=${CHAT_API_KEY:-${CPA_API_KEY:-}}
       - CHAT_MODEL=${CHAT_MODEL:-gpt-5.5}
+      # 轻量任务（查询改写/语境化/HyDE/子查询）快速模型，留空回落 CHAT_MODEL
+      - FAST_CHAT_MODEL=${FAST_CHAT_MODEL:-}
+      # 日报生成与截图识别专用模型，留空回落 CHAT_MODEL
+      - REPORT_MODEL=${REPORT_MODEL:-}
       # Embedding 直连（默认取阿里百炼配置）
       - EMBEDDING_API_BASE=${EMBEDDING_API_BASE:-${DASHSCOPE_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-${DASHSCOPE_API_KEY:-}}

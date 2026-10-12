@@ -32,7 +32,6 @@ from app.api.feedback import router as feedback_router
 from app.api.health import router as health_router
 from app.api.ik_dict import router as ik_dict_router
 from app.api.permissions import router as permissions_router
-from app.api.qa import router as qa_router
 from app.api.rag import router as rag_router
 from app.api.reports import router as reports_router
 from app.api.search import router as search_router
@@ -83,7 +82,6 @@ def create_app() -> FastAPI:
     app.include_router(documents_router)
     app.include_router(search_router)
     app.include_router(rag_router)
-    app.include_router(qa_router)
     app.include_router(reports_router)
     app.include_router(alerts_router)
     app.include_router(daily_materials_router)
