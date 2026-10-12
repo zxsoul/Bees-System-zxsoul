@@ -4,20 +4,23 @@
  * 员工端 · 今日工作台（今日速汇报）
  *
  * 页面结构：
- * 1. 今日材料缓冲区 —— 员工把截图 / 日志 / 文档直接传到这里（Redis 暂存，
- *    不进「文档管理」的长期知识库，48h 自动过期）。每份材料可点击跳转到
- *    查看页核对内容，误传可删除后重传。
- * 2. 今日日报生成区 —— 点击「生成今日日报」，AI 聚合缓冲区全部材料合成
- *    四段式日报，生成内容直接呈现在这里。
- * 3. 历史日报 —— 过往日报留痕。
+ * 1. 今日材料缓冲区 —— 员工把截图 / 日志 / 文档直接传到这里（Redis 个人
+ *    暂存，与空间无关，24h 自动清空，不进「文档管理」）。每份材料可点击
+ *    跳转到查看页核对内容，误传可删除后重传。
+ * 2. 今日日报生成区 —— 点击「生成今日日报」后先产出**草稿**（不入库），
+ *    页面下方提供两个操作：
+ *    - 「确认使用」：草稿正式归档到「日报数据库」空间的当日日期文件夹；
+ *    - 「调整」：输入调整意见，AI 以上一版为基础重新生成。
+ * 3. 历史日报 —— 过往日报留痕（含草稿/已入库状态）。
  *
- * 日报每天在 18:47 也会由系统定时任务自动生成，手动生成只是为了
+ * 日报每天在 18:47 也会由系统定时任务自动生成草稿，手动生成只是为了
  * 「马上看到结果」。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CalendarDays,
+  CheckCircle2,
   Eye,
   File,
   FileText,
@@ -28,10 +31,10 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  Wand2,
 } from "lucide-react";
 import Link from "next/link";
 
-import { apiClient } from "@/lib/api-client";
 import {
   dailyMaterialsApi,
   type DailyMaterial,
@@ -42,12 +45,6 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/components/ui/toast";
-
-interface Space {
-  id: string;
-  name: string;
-  description?: string | null;
-}
 
 const STATUS_LABEL: Record<DailyReport["status"], string> = {
   generating: "生成中",
@@ -79,8 +76,6 @@ function formatTime(iso: string): string {
 }
 
 export default function WorkbenchPage() {
-  const [spaces, setSpaces] = useState<Space[]>([]);
-  const [spaceId, setSpaceId] = useState<string>("");
   const [materials, setMaterials] = useState<DailyMaterial[]>([]);
   const [todayReport, setTodayReport] = useState<DailyReport | null>(null);
   const [history, setHistory] = useState<DailyReport[]>([]);
@@ -89,21 +84,11 @@ export default function WorkbenchPage() {
   const [uploading, setUploading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [adjustMode, setAdjustMode] = useState(false);
+  const [adjustPrompt, setAdjustPrompt] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { addToast } = useToast();
-
-  // 加载空间列表，默认选中第一个
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await apiClient.get<Space[]>("/api/spaces");
-        setSpaces(data);
-        if (data.length > 0) setSpaceId(data[0].id);
-      } catch {
-        addToast({ type: "error", message: "加载空间列表失败" });
-      }
-    })();
-  }, [addToast]);
 
   // ─── 缓冲区材料（个人暂存，与空间无关） ─────────────────────────
 
@@ -163,49 +148,46 @@ export default function WorkbenchPage() {
     }
   };
 
-  // ─── 日报 ────────────────────────────────────────────────────────
+  // ─── 日报（草稿 → 确认入库） ────────────────────────────────────
 
-  const loadReports = useCallback(
-    async (sid: string) => {
-      if (!sid) return;
-      setLoading(true);
-      try {
-        const { reports } = await reportsApi.listMine(sid, 0, 30);
-        const today = new Date().toISOString().slice(0, 10);
-        setTodayReport(
-          reports.find((r) => r.report_date === today) ?? null
-        );
-        setHistory(reports.filter((r) => r.report_date !== today));
-      } catch {
-        addToast({ type: "error", message: "加载日报失败" });
-      } finally {
-        setLoading(false);
-      }
-    },
-    [addToast]
-  );
+  const loadReports = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { reports } = await reportsApi.listMine(undefined, 0, 30);
+      const today = new Date().toISOString().slice(0, 10);
+      setTodayReport(reports.find((r) => r.report_date === today) ?? null);
+      setHistory(reports.filter((r) => r.report_date !== today));
+    } catch {
+      addToast({ type: "error", message: "加载日报失败" });
+    } finally {
+      setLoading(false);
+    }
+  }, [addToast]);
 
   useEffect(() => {
-    loadReports(spaceId);
-  }, [spaceId, loadReports]);
-
-  // 缓冲区是个人暂存区，与空间选择无关，只需加载一次
-  useEffect(() => {
+    loadReports();
     loadMaterials();
-  }, [loadMaterials]);
+  }, [loadReports, loadMaterials]);
 
-  const handleGenerate = async (force: boolean) => {
-    if (!spaceId) return;
+  const handleGenerate = async (opts?: {
+    force?: boolean;
+    adjustPrompt?: string;
+  }) => {
     setGenerating(true);
     try {
-      const report = await reportsApi.generate(spaceId, force);
+      const report = await reportsApi.generate({
+        force: opts?.force ?? false,
+        adjustPrompt: opts?.adjustPrompt,
+      });
       setTodayReport(report);
+      setAdjustMode(false);
+      setAdjustPrompt("");
       addToast({
         type: "success",
-        message: force ? "日报已重新生成" : "日报生成成功",
-        description: "日报已自动入库留痕，主管可以随时检索到",
+        message: opts?.adjustPrompt ? "已按意见重新生成" : "日报草稿生成成功",
+        description: "确认无误后点击下方「确认使用」正式入库",
       });
-      loadReports(spaceId);
+      loadReports();
     } catch (err) {
       addToast({
         type: "error",
@@ -218,30 +200,41 @@ export default function WorkbenchPage() {
     }
   };
 
+  const handleConfirm = async () => {
+    if (!todayReport) return;
+    setConfirming(true);
+    try {
+      const report = await reportsApi.confirm(todayReport.id);
+      setTodayReport(report);
+      addToast({
+        type: "success",
+        message: "日报已确认入库",
+        description: "已归档到「日报数据库」当日文件夹，主管可以随时检索到",
+      });
+      loadReports();
+    } catch (err) {
+      addToast({
+        type: "error",
+        message: "确认入库失败",
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setConfirming(false);
+    }
+  };
+
   // ─── 渲染 ────────────────────────────────────────────────────────
+
+  const isDraft = todayReport?.status === "completed" && !todayReport.confirmed;
+  const isConfirmed = todayReport?.status === "completed" && todayReport.confirmed;
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">今日工作台</h1>
-          <p className="text-sm text-muted-foreground">
-            把今天的工作材料传进缓冲区，AI 一键为你生成当日工作日报
-          </p>
-        </div>
-        {spaces.length > 1 && (
-          <select
-            className="rounded-md border bg-background px-3 py-2 text-sm"
-            value={spaceId}
-            onChange={(e) => setSpaceId(e.target.value)}
-          >
-            {spaces.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
-        )}
+      <div>
+        <h1 className="text-2xl font-bold">今日工作台</h1>
+        <p className="text-sm text-muted-foreground">
+          把今天的工作材料传进缓冲区，AI 一键为你生成当日工作日报
+        </p>
       </div>
 
       {/* 今日材料缓冲区 */}
@@ -346,46 +339,36 @@ export default function WorkbenchPage() {
               <span
                 className={
                   todayReport.status === "completed"
-                    ? "rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700"
+                    ? todayReport.confirmed
+                      ? "rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700"
+                      : "rounded-full bg-blue-100 px-2 py-0.5 text-xs text-blue-700"
                     : todayReport.status === "failed"
                       ? "rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700"
                       : "rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-700"
                 }
               >
-                {STATUS_LABEL[todayReport.status]}
+                {todayReport.status === "completed"
+                  ? todayReport.confirmed
+                    ? "已入库"
+                    : "草稿待确认"
+                  : STATUS_LABEL[todayReport.status]}
               </span>
             )}
           </div>
-          <div className="flex gap-2">
-            {todayReport ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={generating}
-                onClick={() => handleGenerate(true)}
-              >
-                {generating ? (
-                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="mr-1 h-4 w-4" />
-                )}
-                重新生成
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                disabled={generating || !spaceId || materials.length === 0}
-                onClick={() => handleGenerate(false)}
-              >
-                {generating ? (
-                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                ) : (
-                  <Sparkles className="mr-1 h-4 w-4" />
-                )}
-                生成今日日报
-              </Button>
-            )}
-          </div>
+          {!todayReport && (
+            <Button
+              size="sm"
+              disabled={generating || materials.length === 0}
+              onClick={() => handleGenerate()}
+            >
+              {generating ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <Sparkles className="mr-1 h-4 w-4" />
+              )}
+              生成今日日报
+            </Button>
+          )}
         </div>
 
         <Separator className="my-4" />
@@ -401,16 +384,101 @@ export default function WorkbenchPage() {
             <Loader2 className="h-4 w-4 animate-spin" /> 加载中…
           </div>
         ) : todayReport?.status === "completed" ? (
-          <ReportContent content={todayReport.content} />
+          <>
+            <ReportContent content={todayReport.content} />
+
+            <Separator className="my-4" />
+
+            {isDraft && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    disabled={confirming || generating}
+                    onClick={handleConfirm}
+                  >
+                    {confirming ? (
+                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="mr-1 h-4 w-4" />
+                    )}
+                    确认使用
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={confirming || generating}
+                    onClick={() => setAdjustMode((v) => !v)}
+                  >
+                    <Wand2 className="mr-1 h-4 w-4" />
+                    调整
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    草稿暂不入库，确认后才会归档到「日报数据库」
+                  </span>
+                </div>
+
+                {adjustMode && (
+                  <div className="space-y-2 rounded-md border bg-muted/40 p-3">
+                    <textarea
+                      className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-primary"
+                      rows={3}
+                      placeholder="输入调整意见，例如：「今日完成部分再详细一点」「把风险部分精简」「补充明日计划」…"
+                      value={adjustPrompt}
+                      onChange={(e) => setAdjustPrompt(e.target.value)}
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={generating || !adjustPrompt.trim()}
+                      onClick={() =>
+                        handleGenerate({
+                          force: true,
+                          adjustPrompt: adjustPrompt.trim(),
+                        })
+                      }
+                    >
+                      {generating ? (
+                        <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-1 h-4 w-4" />
+                      )}
+                      按意见重新生成
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {isConfirmed && (
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
+                已确认入库
+                {todayReport.confirmed_at &&
+                  ` · ${new Date(todayReport.confirmed_at).toLocaleString("zh-CN")}`}
+                ，已归档到「日报数据库」当日文件夹
+              </p>
+            )}
+          </>
         ) : todayReport?.status === "failed" ? (
-          <p className="text-sm text-destructive">
-            生成失败：{todayReport.error_detail || "未知错误"}
-            ，可点击「重新生成」重试。
-          </p>
+          <div className="space-y-3">
+            <p className="text-sm text-destructive">
+              生成失败：{todayReport.error_detail || "未知错误"}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={generating}
+              onClick={() => handleGenerate({ force: true })}
+            >
+              <RefreshCw className="mr-1 h-4 w-4" />
+              重新生成
+            </Button>
+          </div>
         ) : (
           <p className="text-sm text-muted-foreground">
             今天还没有日报。先把材料传到上方缓冲区，然后点击
-            「生成今日日报」。每天 18:47 系统也会自动生成。
+            「生成今日日报」。每天 18:47 系统也会自动生成草稿。
           </p>
         )}
       </Card>
@@ -435,13 +503,19 @@ export default function WorkbenchPage() {
                 <span
                   className={
                     r.status === "completed"
-                      ? "text-green-600"
+                      ? r.confirmed
+                        ? "text-green-600"
+                        : "text-blue-600"
                       : r.status === "failed"
                         ? "text-destructive"
                         : "text-muted-foreground"
                   }
                 >
-                  {STATUS_LABEL[r.status]}
+                  {r.status === "completed"
+                    ? r.confirmed
+                      ? "已入库"
+                      : "草稿"
+                    : STATUS_LABEL[r.status]}
                 </span>
               </li>
             ))}

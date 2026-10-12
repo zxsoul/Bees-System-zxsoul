@@ -37,7 +37,8 @@ from app.core.minio import ensure_bucket_exists, get_minio_client
 from app.core.redis import get_redis
 from app.models.daily_report import DailyReport, DailyReportStatus
 from app.models.document import Document, DocumentStatus
-from app.models.permission import ResourceType
+from app.models.folder import Folder
+from app.models.permission import AccessLevel, Permission, ResourceType
 from app.models.space import Space
 from app.models.user import User
 from app.services.daily_material_service import DailyMaterialService
@@ -62,6 +63,10 @@ MAX_IMAGES_PER_REPORT = 6
 IMAGE_DESCRIBE_TIMEOUT = 90
 # 日报正文中 LLM 用于插图的占位符（如 [[IMG:M1]]）
 IMG_PLACEHOLDER_RE = re.compile(r"\[\[IMG:(M\d+)\]\]")
+# 草稿阶段的图片预览链接（指向缓冲区 raw 接口），确认入库时替换为永久链接
+PREVIEW_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(/api/daily-materials/([0-9a-f]{32})/raw\)")
+# 日报默认归档空间：所有日报统一进入该空间，按日期文件夹组织
+DEFAULT_SPACE_NAME = "日报数据库"
 # 日报文档标题前缀，用于前端展示标识
 REPORT_TITLE_PREFIX = "工作日报"
 
@@ -101,33 +106,52 @@ class DailyReportService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    # ─── 生成 ─────────────────────────────────────────────────────────
+    # ─── 生成（草稿） ──────────────────────────────────────────────────
 
     async def generate_daily_report(
         self,
         *,
         user: User,
-        space_id: uuid.UUID,
+        space_id: uuid.UUID | None = None,
         report_date: date,
         force: bool = False,
+        adjust_prompt: str | None = None,
     ) -> DailyReport:
-        """为指定员工合成某天的日报（幂等：默认已存在则直接返回）。
+        """为指定员工合成某天的日报**草稿**（幂等：默认已存在则直接返回）。
+
+        「确认后入库」流程的第一步：只合成内容供员工预览，**不回流入库、
+        不转存图片**——插图以缓冲区预览链接呈现（24h 内有效）。员工点击
+        「确认使用」后由 :meth:`confirm_report` 执行归档。
 
         Args:
             user: 日报归属员工
-            space_id: 目标空间（部门/项目）
+            space_id: 目标空间；None 时进入默认归档空间「日报数据库」
             report_date: 日报日期（按 UTC 日界聚合上传记录）
-            force: True 时基于最新材料重新合成并覆盖旧日报
+            force: True 时基于最新材料重新合成并覆盖旧草稿
+            adjust_prompt: 调整意见；提供时以上一版草稿为基础按意见重写
 
         Raises:
-            ForbiddenException: 用户在该空间无写权限（不能替别人/无权空间生成）
-            ValidationException: 当日没有可用的工作材料
+            ForbiddenException: 显式指定空间且无写权限
+            ValidationException: 当日没有可用的工作材料 / 日报已确认入库
         """
-        await self._require_space_action(user, space_id, Action.write)
+        space = await self._resolve_report_space(user, space_id)
+        space_id = space.id
 
         existing = await self._get_report(space_id, user.id, report_date)
-        if existing and existing.status == DailyReportStatus.completed and not force:
+        if existing and existing.confirmed and (force or adjust_prompt):
+            raise ValidationException("日报已确认入库，不能再调整或重新生成")
+        if (
+            existing
+            and existing.status == DailyReportStatus.completed
+            and not force
+            and not adjust_prompt
+        ):
             return existing
+
+        # 调整模式下先留住旧草稿内容（合成时作为参考输入）
+        prev_content = (
+            existing.content if (existing and adjust_prompt) else None
+        )
 
         report = existing or DailyReport(
             space_id=space_id,
@@ -156,29 +180,25 @@ class DailyReportService:
                 (f"M{i}", m) for i, m in enumerate(buffer_materials, start=1)
             ]
             materials = await self._collect_materials(anchored)
-            content = await self._synthesize(user, report_date, materials)
-            # 图文并茂：把 LLM 标记的 [[IMG:Mn]] 占位符替换为真实图片链接；
-            # 被引用的截图从缓冲区转存 MinIO 长期保存（缓冲区本身 24h 过期）
-            content = await self._embed_images(report, content, dict(anchored))
+            content = await self._synthesize(
+                user,
+                report_date,
+                materials,
+                prev_content=prev_content,
+                adjust_prompt=adjust_prompt,
+            )
+            # 图文并茂（草稿阶段）：[[IMG:Mn]] 占位符替换为缓冲区预览链接，
+            # 图片永久归档延迟到「确认使用」时执行
+            content = self._embed_image_previews(content, dict(anchored))
 
             report.content = content
             report.source_document_ids = [m["id"] for m in buffer_materials]
             report.title = self._build_title(user, report_date)
             report.status = DailyReportStatus.completed
+            report.confirmed = False
+            report.confirmed_at = None
             report.generated_at = datetime.now(timezone.utc)
             await self.db.flush()
-
-            # 日报回流入库（失败不阻塞：日报行已落库，主管仍可查看文本）
-            try:
-                document = await self._ingest_report_document(report, content)
-                report.document_id = document.id
-                await self.db.flush()
-            except Exception:
-                logger.warning(
-                    "daily_report ingest failed: report_id=%s",
-                    report.id,
-                    exc_info=True,
-                )
         except Exception as exc:
             report.status = DailyReportStatus.failed
             report.error_detail = str(exc)[:2000]
@@ -187,6 +207,44 @@ class DailyReportService:
             await self.db.commit()
             raise
 
+        await self.db.commit()
+        await self.db.refresh(report)
+        return report
+
+    # ─── 确认入库 ─────────────────────────────────────────────────────
+
+    async def confirm_report(
+        self, *, user: User, report_id: uuid.UUID
+    ) -> DailyReport:
+        """「确认使用」：把草稿日报正式归档入库。
+
+        依次执行：插图转存 MinIO（缓冲区预览链接 → 永久附件链接）→
+        按日期文件夹归档日报文档（走完整 pipeline，主管端可检索）→
+        标记 confirmed。幂等：已确认的直接返回。
+        """
+        stmt = select(DailyReport).where(DailyReport.id == report_id)
+        report = (await self.db.execute(stmt)).scalar_one_or_none()
+        if not report:
+            raise NotFoundException("DailyReport", str(report_id))
+        if report.user_id != user.id and not self._is_admin(user):
+            raise ForbiddenException("只能确认自己的日报")
+        if report.status != DailyReportStatus.completed:
+            raise ValidationException("日报尚未生成完成，无法确认入库")
+        if report.confirmed:
+            return report
+
+        content = await self._persist_images(report, report.content)
+        folder = await self._get_or_create_date_folder(
+            report.space_id, report.report_date
+        )
+        document = await self._ingest_report_document(
+            report, content, folder_id=folder.id
+        )
+
+        report.content = content
+        report.document_id = document.id
+        report.confirmed = True
+        report.confirmed_at = datetime.now(timezone.utc)
         await self.db.commit()
         await self.db.refresh(report)
         return report
@@ -340,26 +398,19 @@ class DailyReportService:
             )
         return "（截图内容识别失败，仅记录截图文件名）"
 
-    # ─── 内部：图文并茂（图片转存与链接替换） ─────────────────────────
+    # ─── 内部：图文并茂（草稿预览 / 确认归档两阶段） ───────────────────
 
-    async def _embed_images(
-        self,
-        report: DailyReport,
-        content: str,
-        materials_by_anchor: dict[str, dict],
+    @staticmethod
+    def _embed_image_previews(
+        content: str, materials_by_anchor: dict[str, dict]
     ) -> str:
-        """把日报中的 ``[[IMG:Mn]]`` 占位符替换为真实图片链接。
+        """草稿阶段：把 ``[[IMG:Mn]]`` 占位符替换为缓冲区预览链接。
 
-        被引用的截图从 Redis 缓冲区转存到 MinIO（``report-assets/{日报ID}/``），
-        与日报一样长期留存——缓冲区本身 24h 过期，不转存图片会裂图。
-        未命中材料 / 非图片 / 转存失败的占位符一律清除，不留残渣。
+        预览链接指向 ``/api/daily-materials/{id}/raw``（24h 内有效），
+        图片永久归档延迟到「确认使用」时由 ``_persist_images`` 完成。
+        未命中材料 / 非图片的占位符一律清除，不留残渣。
         """
         refs = IMG_PLACEHOLDER_RE.findall(content)
-        if not refs:
-            return content
-
-        client = get_minio_client()
-        ensure_bucket_exists()
         for anchor in dict.fromkeys(refs):  # 去重且保留出现顺序
             placeholder = f"[[IMG:{anchor}]]"
             record = materials_by_anchor.get(anchor)
@@ -367,45 +418,100 @@ class DailyReportService:
                 logger.info("report image placeholder unresolved: %s", anchor)
                 content = content.replace(placeholder, "")
                 continue
-
-            ext = record["filename"].rsplit(".", 1)[-1].lower() if "." in record["filename"] else "png"
-            storage_key = f"report-assets/{report.id}/{record['id']}.{ext}"
-            try:
-                client.upload_fileobj(
-                    Fileobj=io.BytesIO(DailyMaterialService.material_bytes(record)),
-                    Bucket=settings.MINIO_BUCKET,
-                    Key=storage_key,
-                    ExtraArgs={
-                        "ContentType": record.get("content_type") or "image/png"
-                    },
-                )
-            except Exception:
-                logger.warning(
-                    "report asset persist failed: report=%s material=%s",
-                    report.id,
-                    record.get("id"),
-                    exc_info=True,
-                )
-                content = content.replace(placeholder, "")
-                continue
-
             image_md = (
                 f"![{record['filename']}]"
-                f"(/api/reports/{report.id}/assets/{record['id']})"
+                f"(/api/daily-materials/{record['id']}/raw)"
             )
             content = content.replace(placeholder, image_md)
-            logger.info(
-                "report asset embedded: report=%s material=%s key=%s",
-                report.id,
-                record["id"],
-                storage_key,
-            )
         return content
+
+    async def _persist_images(self, report: DailyReport, content: str) -> str:
+        """确认入库阶段：把草稿中的缓冲区预览图片转存 MinIO 长期保存。
+
+        预览链接 → ``/api/reports/{id}/assets/{material_id}`` 永久链接。
+        缓冲区已过期的图片替换为文字说明（不抛错，不阻塞入库）。
+        """
+        matches = list(PREVIEW_IMAGE_RE.finditer(content))
+        if not matches:
+            return content
+
+        client = get_minio_client()
+        ensure_bucket_exists()
+        svc = DailyMaterialService()
+        for match in matches:
+            alt, material_id = match.group(1), match.group(2)
+            record = await svc.get_material(material_id)
+            replacement: str | None = None
+            if record and record.get("kind") == "image":
+                ext = (
+                    record["filename"].rsplit(".", 1)[-1].lower()
+                    if "." in record["filename"]
+                    else "png"
+                )
+                storage_key = f"report-assets/{report.id}/{material_id}.{ext}"
+                try:
+                    client.upload_fileobj(
+                        Fileobj=io.BytesIO(
+                            DailyMaterialService.material_bytes(record)
+                        ),
+                        Bucket=settings.MINIO_BUCKET,
+                        Key=storage_key,
+                        ExtraArgs={
+                            "ContentType": record.get("content_type") or "image/png"
+                        },
+                    )
+                    replacement = (
+                        f"![{alt}](/api/reports/{report.id}/assets/{material_id})"
+                    )
+                    logger.info(
+                        "report asset persisted: report=%s material=%s key=%s",
+                        report.id,
+                        material_id,
+                        storage_key,
+                    )
+                except Exception:
+                    logger.warning(
+                        "report asset persist failed: report=%s material=%s",
+                        report.id,
+                        material_id,
+                        exc_info=True,
+                    )
+            if replacement is None:
+                replacement = f"（图片「{alt}」的缓冲材料已过期，未能归档）"
+            content = content.replace(match.group(0), replacement)
+        return content
+
+    async def _get_or_create_date_folder(
+        self, space_id: uuid.UUID, report_date: date
+    ) -> Folder:
+        """在归档空间下找/建以日期命名的根目录文件夹（如 ``2026-10-12``）。
+
+        「日报数据库」空间的组织方式：按日期文件夹分组，打开某天即可看到
+        当日全员日报（类似文件夹的时间线视图）。
+        """
+        name = report_date.isoformat()
+        stmt = select(Folder).where(
+            Folder.space_id == space_id,
+            Folder.parent_id.is_(None),
+            Folder.name == name,
+        )
+        folder = (await self.db.execute(stmt)).scalar_one_or_none()
+        if folder:
+            return folder
+        folder = Folder(space_id=space_id, name=name, depth=1)
+        self.db.add(folder)
+        await self.db.flush()
+        return folder
 
     # ─── 内部：LLM 合成 ────────────────────────────────────────────────
 
     async def _synthesize(
-        self, user: User, report_date: date, materials: str
+        self,
+        user: User,
+        report_date: date,
+        materials: str,
+        prev_content: str | None = None,
+        adjust_prompt: str | None = None,
     ) -> str:
         author = user.display_name or user.email
         system_prompt = REPORT_SYSTEM_PROMPT.format(
@@ -417,6 +523,12 @@ class DailyReportService:
             f"以下是 {author} 在 {report_date.isoformat()} 上传的"
             f"工作材料，请合成当日工作日报：\n\n{materials}"
         )
+        if adjust_prompt and prev_content:
+            prompt += (
+                f"\n\n---\n以下是上一版日报草稿：\n\n{prev_content}\n\n---\n"
+                f"请根据以下调整意见重新生成日报（事实仍以材料为准，只按意见"
+                f"调整结构/详略/表述）：\n{adjust_prompt}"
+            )
         # 思考型模型（如 kimi-k2.6）会把推理过程计入 completion tokens：
         # 预算给小了会出现「思考耗尽预算、正文为空」的情况（finish_reason=length），
         # 因此按阶梯预算重试，直到拿到非空正文。
@@ -451,12 +563,13 @@ class DailyReportService:
     # ─── 内部：日报回流入库 ────────────────────────────────────────────
 
     async def _ingest_report_document(
-        self, report: DailyReport, content: str
+        self, report: DailyReport, content: str, folder_id: uuid.UUID | None = None
     ) -> Document:
         """把日报 Markdown 作为新 Document 走完整 pipeline 入库。
 
         与 ``UploadService.import_url`` 保持同一语义：先提交 DB 再入队，
         保证 worker 拉取时一定能从 DB 读到文档记录。
+        ``folder_id`` 指向按日期命名的归档文件夹。
         """
         content_bytes = content.encode("utf-8")
         storage_path = f"{report.space_id}/{uuid.uuid4()}/{report.title}.md"
@@ -472,7 +585,7 @@ class DailyReportService:
 
         document = Document(
             space_id=report.space_id,
-            folder_id=None,
+            folder_id=folder_id,
             title=report.title,
             file_type="md",
             file_size=len(content_bytes),
@@ -498,6 +611,99 @@ class DailyReportService:
         return document
 
     # ─── 内部：通用 ────────────────────────────────────────────────────
+
+    async def _resolve_report_space(
+        self, user: User, space_id: uuid.UUID | None
+    ) -> Space:
+        """解析日报归档空间。
+
+        - 显式传入 space_id：严格校验写权限（兼容旧调用）；
+        - 缺省：进入默认归档空间「日报数据库」，不存在则以管理员身份创建，
+          并自动为员工补齐该空间的写权限（默认空间对全员开放归档）。
+        """
+        if space_id is not None:
+            await self._require_space_action(user, space_id, Action.write)
+            space = (
+                await self.db.execute(select(Space).where(Space.id == space_id))
+            ).scalar_one_or_none()
+            if space is None:
+                raise NotFoundException("Space", str(space_id))
+            return space
+
+        stmt = select(Space).where(Space.name == DEFAULT_SPACE_NAME)
+        space = (await self.db.execute(stmt)).scalar_one_or_none()
+        if space is None:
+            creator_id = await self._admin_user_id() or user.id
+            space = Space(
+                name=DEFAULT_SPACE_NAME,
+                description="每日工作日报自动归档（按日期文件夹组织）",
+                created_by=creator_id,
+            )
+            self.db.add(space)
+            await self.db.flush()
+            logger.info("default report space created: %s", space.id)
+
+        await self._ensure_space_write(user, space.id)
+        return space
+
+    async def _admin_user_id(self) -> uuid.UUID | None:
+        """系统管理员（INITIAL_ADMIN_EMAIL）的用户 ID，用于默认空间归属。"""
+        email = os.environ.get("INITIAL_ADMIN_EMAIL", "").strip().lower()
+        if not email:
+            return None
+        stmt = select(User.id).where(func.lower(User.email) == email)
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def _ensure_space_write(
+        self, user: User, space_id: uuid.UUID
+    ) -> None:
+        """确保员工对默认归档空间有写权限（缺失则自动授予）。"""
+        if self._is_admin(user):
+            return
+        redis = await get_redis()
+        perm = PermissionService(self.db, redis)
+        allowed = await perm.check_access(
+            user_id=user.id,
+            resource_id=space_id,
+            resource_type=ResourceType.space,
+            action=Action.write,
+        )
+        if allowed:
+            return
+        try:
+            # 走正式授权链路：upsert + 缓存失效 + Qdrant 权限同步
+            await perm.set_space_permission(
+                space_id=space_id,
+                user_id=user.id,
+                access_level=AccessLevel.write,
+            )
+        except Exception:
+            # Qdrant 同步失败等场景兜底：直接落库写权限并清缓存，
+            # 不阻塞日报生成（检索侧权限同步由 watchdog/下次授权补齐）
+            logger.warning(
+                "auto grant write via PermissionService failed, fallback to direct insert",
+                exc_info=True,
+            )
+            await self.db.rollback()
+            stmt = select(Permission).where(
+                Permission.resource_id == space_id,
+                Permission.resource_type == ResourceType.space,
+                Permission.user_id == user.id,
+            )
+            row = (await self.db.execute(stmt)).scalar_one_or_none()
+            if row:
+                row.access_level = AccessLevel.write
+            else:
+                self.db.add(
+                    Permission(
+                        resource_id=space_id,
+                        resource_type=ResourceType.space,
+                        user_id=user.id,
+                        access_level=AccessLevel.write,
+                    )
+                )
+            await self.db.flush()
+            await perm._invalidate_space_cache(user.id, space_id)
 
     async def _get_report(
         self, space_id: uuid.UUID, user_id: uuid.UUID, report_date: date

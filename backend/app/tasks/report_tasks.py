@@ -52,8 +52,6 @@ def auto_generate_daily_reports(target_date: str | None = None) -> dict:
         ``{"date": ..., "generated": n, "skipped": n, "errors": [...]}``
     """
     from app.core.database import AsyncSessionLocal
-    from app.models.daily_report import DailyReport, DailyReportStatus
-    from app.models.permission import AccessLevel, Permission, ResourceType
     from app.models.user import User
     from app.services.daily_material_service import DailyMaterialService
     from app.services.report_service import DailyReportService
@@ -66,67 +64,45 @@ def auto_generate_daily_reports(target_date: str | None = None) -> dict:
 
     async def _run() -> dict:
         summary = {"date": day.isoformat(), "generated": 0, "skipped": 0, "errors": []}
-        # 缓冲区与空间解耦：先找「今天个人缓冲区有材料」的用户，
-        # 再对该用户拥有写权限的每个空间分别生成日报（日报仍按空间归档）。
+        # 缓冲区与空间解耦：找「今天个人缓冲区有材料」的用户，
+        # 为每人生成默认归档空间（日报数据库）里的日报草稿。
+        # 生成的是「待确认」草稿，员工确认后才正式入库；
+        # 已有草稿/日报的用户由 generate 的幂等逻辑直接返回，不重复合成。
         user_ids = await DailyMaterialService().iter_active_users(day)
 
         for user_id in user_ids:
             async with AsyncSessionLocal() as session:
-                perm_stmt = select(Permission.resource_id).where(
-                    Permission.user_id == user_id,
-                    Permission.resource_type == ResourceType.space,
-                    Permission.access_level == AccessLevel.write,
-                )
-                space_ids = list((await session.execute(perm_stmt)).scalars().all())
+                try:
+                    user = (
+                        await session.execute(
+                            select(User).where(User.id == user_id)
+                        )
+                    ).scalar_one_or_none()
+                    if not user:
+                        continue
 
-            for space_id in space_ids:
-                async with AsyncSessionLocal() as session:
-                    try:
-                        # 已有完成的日报则跳过（幂等；force 重算走 API）
-                        existing = await session.execute(
-                            select(DailyReport).where(
-                                DailyReport.space_id == space_id,
-                                DailyReport.user_id == user_id,
-                                DailyReport.report_date == day,
-                                DailyReport.status == DailyReportStatus.completed,
-                            )
-                        )
-                        if existing.scalar_one_or_none():
-                            summary["skipped"] += 1
-                            continue
-
-                        user = (
-                            await session.execute(
-                                select(User).where(User.id == user_id)
-                            )
-                        ).scalar_one_or_none()
-                        if not user:
-                            continue
-
-                        service = DailyReportService(session)
-                        await service.generate_daily_report(
-                            user=user,
-                            space_id=space_id,
-                            report_date=day,
-                            force=False,
-                        )
-                        summary["generated"] += 1
-                    except Exception as exc:  # noqa: BLE001 — 单人失败不阻塞其他人
-                        logger.warning(
-                            "auto daily report failed: space=%s user=%s error=%s",
-                            space_id,
-                            user_id,
-                            exc,
-                            exc_info=True,
-                        )
-                        summary["errors"].append(
-                            {
-                                "space_id": str(space_id),
-                                "user_id": str(user_id),
-                                "error": str(exc)[:500],
-                            }
-                        )
-                        await session.rollback()
+                    service = DailyReportService(session)
+                    await service.generate_daily_report(
+                        user=user,
+                        space_id=None,  # 默认归档空间「日报数据库」
+                        report_date=day,
+                        force=False,
+                    )
+                    summary["generated"] += 1
+                except Exception as exc:  # noqa: BLE001 — 单人失败不阻塞其他人
+                    logger.warning(
+                        "auto daily report failed: user=%s error=%s",
+                        user_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    summary["errors"].append(
+                        {
+                            "user_id": str(user_id),
+                            "error": str(exc)[:500],
+                        }
+                    )
+                    await session.rollback()
         return summary
 
     return _run_async(_run())

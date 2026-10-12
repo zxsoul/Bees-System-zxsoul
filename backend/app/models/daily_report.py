@@ -74,6 +74,14 @@ class DailyReport(Base, UUIDMixin, TimestampMixin):
     generated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 「确认后入库」流程：生成只是草稿（可预览/调整/重新生成），
+    # 员工点击「确认使用」后才回流入库、归档图片、写入 confirmed_at。
+    confirmed: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default="false"
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Relationships
     space = relationship("Space", lazy="selectin")

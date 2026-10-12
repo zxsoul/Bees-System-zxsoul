@@ -27,6 +27,8 @@ export interface DailyReport {
   status: "generating" | "completed" | "failed";
   error_detail: string | null;
   generated_at: string | null;
+  confirmed: boolean;
+  confirmed_at: string | null;
   created_at: string;
 }
 
@@ -63,13 +65,27 @@ export interface ProgressAlertList {
 // ─── Reports API ─────────────────────────────────────────────────────
 
 export const reportsApi = {
-  /** 生成（或获取已有的）当日日报；force=true 基于最新材料重新合成 */
-  generate: (spaceId: string, force = false, reportDate?: string) =>
+  /**
+   * 生成（或获取已有的）当日日报草稿；force=true 基于最新材料重新合成；
+   * adjustPrompt 提供时以上一版草稿为基础按意见重新生成。
+   * 日报缺省进入默认归档空间「日报数据库」，无需选择空间。
+   */
+  generate: (opts: {
+    spaceId?: string;
+    force?: boolean;
+    reportDate?: string;
+    adjustPrompt?: string;
+  }) =>
     apiClient.post<DailyReport>("/api/reports/generate", {
-      space_id: spaceId,
-      report_date: reportDate ?? null,
-      force,
+      space_id: opts.spaceId ?? null,
+      report_date: opts.reportDate ?? null,
+      force: opts.force ?? false,
+      adjust_prompt: opts.adjustPrompt ?? null,
     }),
+
+  /** 确认使用：草稿正式入库（图片归档 + 写入日报数据库当日文件夹） */
+  confirm: (reportId: string) =>
+    apiClient.post<DailyReport>(`/api/reports/${reportId}/confirm`),
 
   /** 员工：我的历史日报 */
   listMine: (spaceId?: string, skip = 0, limit = 20) => {
