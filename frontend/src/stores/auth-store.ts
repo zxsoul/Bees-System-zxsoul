@@ -6,6 +6,7 @@ interface User {
   email: string;
   display_name: string;
   is_admin?: boolean;
+  can_view_team_reports?: boolean;
 }
 
 interface AuthState {

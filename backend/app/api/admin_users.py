@@ -38,6 +38,7 @@ class UserListItem(BaseModel):
     display_name: str = ""
     is_admin: bool
     is_active: bool
+    can_view_team_reports: bool = False
     oidc_provider: str | None = None
     failed_login_count: int = 0
     locked_until: datetime | None = None
@@ -66,6 +67,12 @@ class SetRoleRequest(BaseModel):
     role: str = Field(..., description="目标角色, 当前只接受 'user' 或 'admin'")
 
 
+class SetTeamReportsPermissionRequest(BaseModel):
+    """设置用户的「全员日报查看」权限。"""
+
+    can_view_team_reports: bool
+
+
 # ─── Helpers ────────────────────────────────────────────────────────────
 
 
@@ -80,6 +87,7 @@ def _to_list_item(user: User) -> UserListItem:
         display_name=user.display_name or "",
         is_admin=is_admin_user(user),
         is_active=is_active,
+        can_view_team_reports=user.can_view_team_reports,
         oidc_provider=user.oidc_provider,
         failed_login_count=user.failed_login_count,
         locked_until=locked,
@@ -167,6 +175,36 @@ async def set_user_active(
     else:
         user.locked_until = datetime.now(timezone.utc) + timedelta(days=365 * 100)
 
+    await db.flush()
+    await db.refresh(user)
+    return _to_list_item(user)
+
+
+@router.put("/{user_id}/team-reports-permission", response_model=UserListItem)
+async def set_team_reports_permission(
+    user_id: str,
+    body: SetTeamReportsPermissionRequest,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserListItem:
+    """设置用户的「全员日报查看」权限。
+
+    True：该用户可在进度中心查看所有员工的日报（跨空间，无差别），
+    与空间创建者（主管）的查看范围一致；False：收回权限，恢复为
+    「只能看自己的日报」。管理员账号天然可见，无需设置。
+    """
+    try:
+        target_uuid = uuid.UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="user_id 不是合法 UUID") from exc
+
+    user = (
+        await db.execute(select(User).where(User.id == target_uuid))
+    ).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    user.can_view_team_reports = body.can_view_team_reports
     await db.flush()
     await db.refresh(user)
     return _to_list_item(user)

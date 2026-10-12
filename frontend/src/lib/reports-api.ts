@@ -96,9 +96,10 @@ export const reportsApi = {
     return apiClient.get<DailyReportList>(`/api/reports/my?${params}`);
   },
 
-  /** 主管：空间全员日报（需要空间 write 权限） */
-  listTeam: (spaceId: string, reportDate?: string, skip = 0, limit = 50) => {
-    const params = new URLSearchParams({ space_id: spaceId });
+  /** 主管/被授权用户：全员日报（spaceId 缺省时跨空间查看全部） */
+  listTeam: (spaceId?: string, reportDate?: string, skip = 0, limit = 50) => {
+    const params = new URLSearchParams();
+    if (spaceId) params.set("space_id", spaceId);
     if (reportDate) params.set("report_date", reportDate);
     params.set("skip", String(skip));
     params.set("limit", String(limit));

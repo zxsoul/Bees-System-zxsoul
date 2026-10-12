@@ -84,6 +84,7 @@ class UserResponse(BaseModel):
     email: str
     display_name: str | None = None
     is_admin: bool = False
+    can_view_team_reports: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -214,6 +215,7 @@ async def me(current_user: User = Depends(get_current_user)) -> UserResponse:
         email=current_user.email,
         display_name=current_user.display_name,
         is_admin=is_admin_user(current_user),
+        can_view_team_reports=current_user.can_view_team_reports,
     )
 
 
@@ -283,4 +285,6 @@ async def update_me(
         id=str(current_user.id),
         email=current_user.email,
         display_name=current_user.display_name,
+        is_admin=is_admin_user(current_user),
+        can_view_team_reports=current_user.can_view_team_reports,
     )

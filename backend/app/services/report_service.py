@@ -277,22 +277,26 @@ class DailyReportService:
         self,
         *,
         requester: User,
-        space_id: uuid.UUID,
+        space_id: uuid.UUID | None,
         report_date: date | None = None,
         skip: int = 0,
         limit: int = 50,
     ) -> tuple[list[DailyReport], int]:
-        """主管查看空间（部门/项目）内全员日报。
+        """查看全员日报（进度中心 · 全员日报）。
 
-        鉴权：系统管理员或空间创建者（主管）。普通成员只有 read/write
-        材料权限，无法查看他人日报——天然实现「成员看自己、主管看全员」。
+        鉴权（``require_team_reports_viewer``）：系统管理员、被管理员
+        授予 ``can_view_team_reports`` 的用户，或目标空间创建者（主管）。
+        被授权用户可不传 ``space_id`` 跨空间查看所有员工日报；
+        普通成员只有 read/write 材料权限，无法查看他人日报——
+        天然实现「成员看自己、主管/被授权者看全员」。
         """
-        await self.require_space_manager(requester, space_id)
+        await self.require_team_reports_viewer(requester, space_id)
 
-        stmt = select(DailyReport).where(DailyReport.space_id == space_id)
-        count_stmt = select(func.count(DailyReport.id)).where(
-            DailyReport.space_id == space_id
-        )
+        stmt = select(DailyReport)
+        count_stmt = select(func.count(DailyReport.id))
+        if space_id:
+            stmt = stmt.where(DailyReport.space_id == space_id)
+            count_stmt = count_stmt.where(DailyReport.space_id == space_id)
         if report_date:
             stmt = stmt.where(DailyReport.report_date == report_date)
             count_stmt = count_stmt.where(DailyReport.report_date == report_date)
@@ -307,14 +311,14 @@ class DailyReportService:
     async def get_report(
         self, *, requester: User, report_id: uuid.UUID
     ) -> DailyReport:
-        """查看单份日报：本人或空间主管（空间创建者/管理员）。"""
+        """查看单份日报：本人、被授权的全员日报查看者或空间主管。"""
         stmt = select(DailyReport).where(DailyReport.id == report_id)
         report = (await self.db.execute(stmt)).scalar_one_or_none()
         if not report:
             raise NotFoundException("DailyReport", str(report_id))
 
         if report.user_id != requester.id:
-            await self.require_space_manager(requester, report.space_id)
+            await self.require_team_reports_viewer(requester, report.space_id)
         return report
 
     # ─── 内部：材料聚合（Redis 缓冲区） ───────────────────────────────
@@ -787,6 +791,24 @@ class DailyReportService:
             raise NotFoundException("Space", str(space_id))
         if creator_id != user.id:
             raise ForbiddenException("需要该空间的主管权限")
+
+    async def require_team_reports_viewer(
+        self, user: User, space_id: uuid.UUID | None
+    ) -> None:
+        """「全员日报查看者」判定（进度中心 · 全员日报）。
+
+        放行任一：系统管理员 / 被管理员授予 ``can_view_team_reports``
+        的用户（跨空间无差别查看）/ 目标空间的创建者（主管）。
+        ``space_id`` 为 None 表示跨空间查询，此时只有管理员或
+        被授权用户放行，避免普通成员枚举全部空间日报。
+        """
+        if self._is_admin(user):
+            return
+        if user.can_view_team_reports:
+            return
+        if space_id is None:
+            raise ForbiddenException("没有全员日报的查看权限，请联系管理员开通")
+        await self.require_space_manager(user, space_id)
 
     @staticmethod
     def _is_admin(user: User) -> bool:

@@ -9,8 +9,9 @@
  * 2. 全员日报 —— 按日期查看空间内所有成员的 AI 日报，可展开原文；
  *    更细颗粒度的追问走「AI 问答」（日报已回流入库，支持引用溯源）。
  *
- * 权限：需要目标空间的 write 权限（主管由管理员授权），普通成员访问
- * 会看到 403 提示。
+ * 权限：进度预警需要目标空间的主管身份（空间创建者）；全员日报对
+ * 空间主管 / 系统管理员 / 被管理员授予「全员日报查看」权限的用户开放，
+ * 被授权用户可跨空间查看所有员工日报，无权限时会看到 403 提示。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -38,6 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/components/ui/toast";
+import { useAuthStore } from "@/stores/auth-store";
 
 interface Space {
   id: string;
@@ -83,8 +85,12 @@ export default function AlertsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [forbidden, setForbidden] = useState(false);
+  const [alertsForbidden, setAlertsForbidden] = useState(false);
+  const [reportsForbidden, setReportsForbidden] = useState(false);
   const { addToast } = useToast();
+  const user = useAuthStore((s) => s.user);
+  // 被管理员授权「全员日报查看」的用户（含管理员）可跨空间查看全部日报
+  const canViewAllReports = !!(user?.can_view_team_reports || user?.is_admin);
 
   useEffect(() => {
     (async () => {
@@ -102,7 +108,7 @@ export default function AlertsPage() {
     async (sid: string) => {
       if (!sid) return;
       setLoading(true);
-      setForbidden(false);
+      setAlertsForbidden(false);
       try {
         const { alerts } = await alertsApi.list(
           sid,
@@ -111,7 +117,7 @@ export default function AlertsPage() {
         setAlerts(alerts);
       } catch (err) {
         if (err instanceof Error && "status" in err && err.status === 403) {
-          setForbidden(true);
+          setAlertsForbidden(true);
         } else {
           addToast({ type: "error", message: "加载预警失败" });
         }
@@ -124,18 +130,19 @@ export default function AlertsPage() {
 
   const loadTeamReports = useCallback(
     async (sid: string) => {
-      if (!sid) return;
+      // 被授权用户无需空间即可跨空间查看；否则按目标空间查（需主管身份）
+      if (!sid && !canViewAllReports) return;
       setLoading(true);
-      setForbidden(false);
+      setReportsForbidden(false);
       try {
         const { reports } = await reportsApi.listTeam(
-          sid,
+          canViewAllReports ? undefined : sid,
           reportDate || undefined
         );
         setTeamReports(reports);
       } catch (err) {
         if (err instanceof Error && "status" in err && err.status === 403) {
-          setForbidden(true);
+          setReportsForbidden(true);
         } else {
           addToast({ type: "error", message: "加载全员日报失败" });
         }
@@ -143,7 +150,7 @@ export default function AlertsPage() {
         setLoading(false);
       }
     },
-    [reportDate, addToast]
+    [reportDate, addToast, canViewAllReports]
   );
 
   useEffect(() => {
@@ -209,10 +216,11 @@ export default function AlertsPage() {
         </button>
       </div>
 
-      {forbidden ? (
+      {(tab === "alerts" ? alertsForbidden : reportsForbidden) ? (
         <Card className="p-6 text-sm text-muted-foreground">
-          当前账号不是该空间的主管（空间创建者）。请用创建该空间的账号登录，
-          或联系管理员处理。
+          {tab === "alerts"
+            ? "当前账号不是该空间的主管（空间创建者）。请用创建该空间的账号登录，或联系管理员处理。"
+            : "当前账号暂无全员日报查看权限。请联系管理员在「系统管理 → 用户管理」中开通。"}
         </Card>
       ) : loading ? (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">

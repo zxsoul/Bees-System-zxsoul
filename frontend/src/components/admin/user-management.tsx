@@ -14,6 +14,7 @@ interface User {
   email: string;
   display_name: string;
   role: string;
+  can_view_team_reports: boolean;
   created_at: string;
   last_login_at: string | null;
 }
@@ -90,6 +91,33 @@ export function UserManagement() {
     }
   };
 
+  const handleTeamReportsToggle = async (userId: string, allowed: boolean) => {
+    // 乐观更新，失败回滚
+    setUsers((prev) =>
+      prev.map((u) =>
+        u.id === userId ? { ...u, can_view_team_reports: allowed } : u
+      )
+    );
+    try {
+      await apiClient.put(`/api/admin/users/${userId}/team-reports-permission`, {
+        can_view_team_reports: allowed,
+      });
+      addToast({
+        type: "success",
+        message: allowed ? "已开通全员日报查看权限" : "已收回全员日报查看权限",
+      });
+    } catch (err) {
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === userId ? { ...u, can_view_team_reports: !allowed } : u
+        )
+      );
+      if (err instanceof ApiClientError) {
+        addToast({ type: "error", message: "权限设置失败", description: err.message });
+      }
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Search */}
@@ -111,6 +139,7 @@ export function UserManagement() {
               <th className="px-4 py-3 text-left font-medium">用户名</th>
               <th className="px-4 py-3 text-left font-medium">邮箱</th>
               <th className="px-4 py-3 text-left font-medium">角色</th>
+              <th className="px-4 py-3 text-left font-medium">全员日报</th>
               <th className="px-4 py-3 text-left font-medium">注册时间</th>
               <th className="px-4 py-3 text-left font-medium">最近登录</th>
               <th className="px-4 py-3 text-left font-medium">操作</th>
@@ -119,13 +148,13 @@ export function UserManagement() {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
+                <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
                   加载中...
                 </td>
               </tr>
             ) : users.length === 0 ? (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
+                <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
                   {debouncedSearch ? "未找到匹配的用户" : "暂无用户"}
                 </td>
               </tr>
@@ -148,6 +177,19 @@ export function UserManagement() {
                         </option>
                       ))}
                     </select>
+                  </td>
+                  <td className="px-4 py-3">
+                    <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-primary"
+                        checked={!!user.can_view_team_reports}
+                        onChange={(e) =>
+                          handleTeamReportsToggle(user.id, e.target.checked)
+                        }
+                      />
+                      {user.can_view_team_reports ? "可看全员" : "仅本人"}
+                    </label>
                   </td>
                   <td className="px-4 py-3 text-muted-foreground">
                     {new Date(user.created_at).toLocaleDateString("zh-CN")}

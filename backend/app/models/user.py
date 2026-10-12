@@ -41,6 +41,14 @@ class User(Base, UUIDMixin, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
     )
+    # 功能级权限：是否可查看全员日报（进度中心 · 全员日报）。
+    # 由管理员在用户管理中分配；后续若扩展为「按员工粒度授权」，
+    # 可迁移到独立的关联表，本字段作为快速开关保留。
+    can_view_team_reports: Mapped[bool] = mapped_column(
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
 
     # Relationships
     spaces = relationship("Space", back_populates="creator", lazy="selectin")

@@ -8,8 +8,9 @@
 
 鉴权：全员接口依赖 :func:`get_current_user`；越权防护在
 :class:`DailyReportService` 内完成——员工生成自己的日报需要空间 write
-权限（与上传材料一致），「全员视图」要求空间创建者（主管）或系统管理员，
-普通成员无法查看他人日报。图片附件与日报详情同一权限口径。
+权限（与上传材料一致），「全员视图」放行：空间创建者（主管）、系统
+管理员，或被管理员授予 ``can_view_team_reports`` 的用户（可跨空间
+无差别查看）。图片附件与日报详情同一权限口径。
 """
 
 import asyncio
@@ -161,18 +162,21 @@ async def list_my_reports(
 
 @router.get("/api/reports/team", response_model=DailyReportListResponse)
 async def list_team_reports(
-    space_id: str = Query(..., description="目标空间 ID"),
+    space_id: str | None = Query(
+        None,
+        description="目标空间 ID；被授权的全员日报查看者可缺省，跨空间查看全部",
+    ),
     report_date: date | None = Query(None, description="按日期过滤"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DailyReportListResponse:
-    """主管查看空间内全员日报（需空间主管权限，否则 403）。"""
+    """查看全员日报（需空间主管权限或被授予全员日报查看权限，否则 403）。"""
     service = DailyReportService(db)
     reports, total = await service.list_team_reports(
         requester=current_user,
-        space_id=uuid.UUID(space_id),
+        space_id=uuid.UUID(space_id) if space_id else None,
         report_date=report_date,
         skip=skip,
         limit=limit,

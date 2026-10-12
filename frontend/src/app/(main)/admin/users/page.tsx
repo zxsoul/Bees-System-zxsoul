@@ -8,7 +8,7 @@ export default function AdminUsersPage() {
       <div>
         <h1 className="text-2xl font-bold">用户管理</h1>
         <p className="text-muted-foreground mt-1">
-          管理用户列表、搜索用户、分配角色
+          管理用户列表、搜索用户、分配角色与全员日报查看权限
         </p>
       </div>
       <UserManagement />
