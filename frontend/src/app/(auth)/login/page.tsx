@@ -22,7 +22,7 @@ function LoginContent() {
         <div className="flex justify-center">
           <WikforgeLogo size={48} />
         </div>
-        <CardTitle className="text-2xl">登录 Wikforge</CardTitle>
+        <CardTitle className="text-2xl">登录蜂巢</CardTitle>
         <CardDescription>输入您的账号信息以访问工作台</CardDescription>
       </CardHeader>
       <CardContent>

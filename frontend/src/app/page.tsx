@@ -17,7 +17,12 @@ export default function Home() {
       <div className="relative z-10 flex w-full flex-col justify-center px-8 py-16 sm:px-16 lg:w-[46%] lg:pl-24">
         <div className="mb-14 flex items-center gap-3">
           <WikforgeLogo size={40} />
-          <span className="text-[22px] font-bold tracking-tight">Wikforge</span>
+          <span className="text-[22px] font-bold tracking-tight">
+            蜂巢
+            <span className="ml-2 align-middle text-xs font-semibold tracking-[0.14em] text-muted-foreground">
+              BEES
+            </span>
+          </span>
         </div>
 
         <h1 className="mb-5 text-4xl font-bold leading-[1.28] tracking-tight sm:text-5xl">

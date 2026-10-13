@@ -165,7 +165,7 @@ export default function DashboardPage() {
       <div>
         <h1 className="text-2xl font-bold">概览</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          欢迎使用 Wikforge 智能工作汇报与进度洞察系统 ——
+          欢迎使用蜂巢智能工作汇报与进度洞察系统 ——
           员工免写汇报, 主管免开汇报会, 进度每天自动沉淀、可查可追问。
         </p>
       </div>

@@ -148,14 +148,17 @@ export function Sidebar() {
         {/* Logo */}
         <div className="flex h-14 items-center border-b px-4">
           {isCollapsed ? (
-            <Link href="/" className="mx-auto" aria-label="Wikforge">
+            <Link href="/" className="mx-auto" aria-label="蜂巢 Bees">
               <WikforgeLogo size={28} />
             </Link>
           ) : (
             <Link href="/" className="flex items-center gap-2">
               <WikforgeLogo size={28} />
               <span className="text-lg font-bold tracking-tight text-sidebar-foreground">
-                Wikforge
+                蜂巢
+                <span className="ml-1.5 text-[10px] font-semibold tracking-[0.12em] text-muted-foreground">
+                  BEES
+                </span>
               </span>
             </Link>
           )}

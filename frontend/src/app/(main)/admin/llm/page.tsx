@@ -30,7 +30,7 @@ export default function AdminLLMPage() {
         <CardHeader>
           <CardTitle>直连架构说明</CardTitle>
           <CardDescription>
-            Wikforge 后端通过 openai SDK 直接调用上游模型服务，不经过任何
+            蜂巢后端通过 openai SDK 直接调用上游模型服务，不经过任何
             中间代理层。
           </CardDescription>
         </CardHeader>
@@ -46,7 +46,7 @@ export default function AdminLLMPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>当前 Wikforge 使用的模型</CardTitle>
+          <CardTitle>当前蜂巢使用的模型</CardTitle>
           <CardDescription>
             来自后端 .env 配置, 修改后需重启 wikforge-api / wikforge-worker
             容器
